@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import pdfplumber; pdf = pdfplumber.open\\('文件/技術文件.pdf'\\); [print\\(f'=== Page {i+1} ===\\\\n{page.extract_text\\(\\)}'\\) for i, page in enumerate\\(pdf.pages\\)]; pdf.close\\(\\)\")",
+      "Bash(python -c \"import PyPDF2; f=open\\('文件/技術文件.pdf','rb'\\); r=PyPDF2.PdfReader\\(f\\); [print\\(f'=== Page {i+1} ===\\\\n{r.pages[i].extract_text\\(\\)}'\\) for i in range\\(len\\(r.pages\\)\\)]; f.close\\(\\)\")"
+    ]
+  }
+}
