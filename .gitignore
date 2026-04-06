@@ -1,0 +1,10 @@
+# Python 環境與快取
+venv/
+__pycache__/
+*.pyc
+
+# 環境變數與機密資訊
+.env
+
+# VS Code 設定檔 (視團隊需求可保留，但通常忽略)
+.vscode/
