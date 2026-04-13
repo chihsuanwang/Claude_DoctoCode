@@ -312,6 +312,17 @@ with tab1:
 
             st.markdown("**方式二：上傳部位 CSV**")
             st.caption("格式：標的名稱, 持有數量")
+            # 下載範例 CSV
+            _sample_names = list(available[:min(3, len(available))]) if available else ["2330.TW", "2317.TW", "2454.TW"]
+            _sample_qty   = [100, -50, 200][:len(_sample_names)]
+            _sample_df    = pd.DataFrame({"標的名稱": _sample_names, "持有數量": _sample_qty})
+            _csv_bytes    = _sample_df.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                label="⬇️ 下載範例 CSV",
+                data=_csv_bytes,
+                file_name="sample_positions.csv",
+                mime="text/csv",
+            )
             pos_file = st.file_uploader("上傳部位檔（CSV）", type=["csv"],
                                          label_visibility="collapsed")
             if pos_file:
