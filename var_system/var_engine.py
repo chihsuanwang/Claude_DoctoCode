@@ -155,6 +155,98 @@ class VaRResult:
 # 工具函式
 # ─────────────────────────────────────────────────────────────
 
+def preprocess_prices(
+    prices: pd.DataFrame,
+    ffill_limit: int = 5,
+) -> tuple:
+    """
+    前處理價格序列：前向填補假日缺口，並統計補值情況。
+
+    處理邏輯
+    --------
+    1. 前向填補（ffill）：市場休市 → 沿用前一收盤價（回報 = 0），
+       上限 ffill_limit 天，避免長期停牌被誤補。
+    2. 剩餘 NaN（ffill 無法補的，通常為新上市標的的歷史起始空白）
+       → 整列刪除，所有標的截短至共同有效期間。
+
+    Parameters
+    ----------
+    prices      : 原始收盤價 DataFrame（index=日期，columns=標的名稱）
+    ffill_limit : 最大連續前向填補天數（預設 5，即不超過一週）
+
+    Returns
+    -------
+    processed : 清理後的 DataFrame（可直接傳入 VaRCalculator）
+    stats     : dict，內含以下欄位：
+        'per_asset'      {標的: {'original_nulls', 'filled', 'remaining_nulls', 'start_date'}}
+        'ffill_limit'    int
+        'rows_before'    原始列數
+        'rows_after'     清理後列數
+        'effective_T'    預計回報筆數（= rows_after - 1）
+        'dropped_rows'   被刪除的列數
+        'truncated_by'   造成截短的標的名稱（若有）
+        'any_filled'     bool，是否有任何前向填補
+        'any_truncated'  bool，是否有列因 NaN 被刪除
+    """
+    df = prices.copy().sort_index()
+    rows_before = len(df)
+
+    # 記錄 ffill 前各標的 NaN 數
+    nulls_before = df.isna().sum()
+
+    # 前向填補（限制連續填補天數）
+    df_ffilled = df.ffill(limit=ffill_limit)
+
+    # 填補後剩餘 NaN（新上市標的的早期空白）
+    nulls_after = df_ffilled.isna().sum()
+    fill_counts = nulls_before - nulls_after
+
+    # 刪除仍含 NaN 的列（任一標的仍缺值）
+    df_clean = df_ffilled.dropna(how="any")
+    rows_after = len(df_clean)
+
+    # 找出哪個標的歷史最短（造成截短）
+    truncated_by = None
+    first_valid_dates = {col: df[col].first_valid_index() for col in df.columns}
+    if rows_after < rows_before:
+        latest_col = max(
+            first_valid_dates,
+            key=lambda c: first_valid_dates[c] if first_valid_dates[c] is not None else df.index[0]
+        )
+        if (first_valid_dates[latest_col] is not None
+                and first_valid_dates[latest_col] > df.index[0]):
+            truncated_by = latest_col
+
+    # 逐標的統計
+    per_asset = {}
+    for col in df.columns:
+        fv = first_valid_dates[col]
+        try:
+            start_str = fv.strftime("%Y-%m-%d") if fv is not None else None
+        except AttributeError:
+            start_str = str(fv) if fv is not None else None
+        per_asset[col] = {
+            "original_nulls":   int(nulls_before[col]),
+            "filled":           int(fill_counts[col]),
+            "remaining_nulls":  int(nulls_after[col]),
+            "start_date":       start_str,
+        }
+
+    stats = {
+        "per_asset":     per_asset,
+        "ffill_limit":   ffill_limit,
+        "rows_before":   rows_before,
+        "rows_after":    rows_after,
+        "effective_T":   max(0, rows_after - 1),
+        "dropped_rows":  rows_before - rows_after,
+        "truncated_by":  truncated_by,
+        "any_filled":    bool(fill_counts.sum() > 0),
+        "any_truncated": rows_after < rows_before,
+    }
+
+    return df_clean, stats
+
+
 def compute_returns(prices: pd.DataFrame, method: str = "log") -> pd.DataFrame:
     """
     計算報酬率序列。

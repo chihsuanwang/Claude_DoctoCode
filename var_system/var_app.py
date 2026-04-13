@@ -26,6 +26,7 @@ import warnings
 from var_engine import (
     VaRCalculator, Position, VaRResult,
     detect_asset_currency, get_market_label, DEFAULT_SPOT_FX,
+    preprocess_prices,
 )
 
 warnings.filterwarnings("ignore")
@@ -229,21 +230,62 @@ with tab1:
             if uploaded_file:
                 try:
                     if uploaded_file.name.endswith(".csv"):
-                        df = pd.read_csv(uploaded_file, index_col=0, parse_dates=True)
+                        df_raw = pd.read_csv(uploaded_file, index_col=0, parse_dates=True)
                     else:
-                        df = pd.read_excel(uploaded_file, index_col=0, parse_dates=True)
+                        df_raw = pd.read_excel(uploaded_file, index_col=0, parse_dates=True)
 
-                    df = df.sort_index().dropna(how="all")
-                    df = df.apply(pd.to_numeric, errors="coerce")
-                    prices_df = df
+                    df_raw = df_raw.sort_index().dropna(how="all")
+                    df_raw = df_raw.apply(pd.to_numeric, errors="coerce")
+
+                    # ── 前處理：ffill + 統計 ──
+                    prices_df, pp_stats = preprocess_prices(df_raw, ffill_limit=5)
+                    st.session_state["preprocess_stats"] = pp_stats
 
                     st.markdown(f"""
 <div class="success-box">
-✅ 成功載入：<b>{len(df)} 個交易日 × {len(df.columns)} 個標的</b><br>
-期間：{df.index[0].strftime('%Y-%m-%d')} ～ {df.index[-1].strftime('%Y-%m-%d')}
+✅ 成功載入：原始 <b>{pp_stats['rows_before']} 列 × {len(df_raw.columns)} 個標的</b>，
+有效期間（清理後）：<b>{pp_stats['rows_after']} 列</b>，
+預計可用回報筆數 T = <b>{pp_stats['effective_T']}</b><br>
+期間：{prices_df.index[0].strftime('%Y-%m-%d')} ～ {prices_df.index[-1].strftime('%Y-%m-%d')}
 </div>
 """, unsafe_allow_html=True)
-                    st.dataframe(df.tail(5).style.format("{:.2f}"), use_container_width=True)
+
+                    # ── 顯示缺失資料處理統計 ──
+                    _any_issue = pp_stats["any_filled"] or pp_stats["any_truncated"]
+                    with st.expander(
+                        ("⚠️ 缺失資料處理詳情（有補值或截短）"
+                         if _any_issue else "✅ 資料品質檢查（無缺失）"),
+                        expanded=_any_issue
+                    ):
+                        _stat_rows = []
+                        for asset, s in pp_stats["per_asset"].items():
+                            if s["filled"] > 0 or s["remaining_nulls"] > 0:
+                                status = "🟡 已 ffill 補值" if s["remaining_nulls"] == 0 else "🔴 仍有缺值"
+                            else:
+                                status = "✅ 完整"
+                            _stat_rows.append({
+                                "標的": asset,
+                                "資料起始": s["start_date"] or "—",
+                                "原始缺值筆": s["original_nulls"],
+                                "ffill 補值": s["filled"],
+                                "補後仍缺": s["remaining_nulls"],
+                                "狀態": status,
+                            })
+                        st.dataframe(pd.DataFrame(_stat_rows), use_container_width=True, hide_index=True)
+
+                        if pp_stats["any_filled"]:
+                            st.caption(
+                                f"前向填補（ffill）上限：{pp_stats['ffill_limit']} 個連續交易日。"
+                                "假日休市補前一收盤價 → 該日回報視為 0（保守處理）。"
+                            )
+                        if pp_stats["any_truncated"]:
+                            msg = (f"刪除了 {pp_stats['dropped_rows']} 列含 NaN 的資料"
+                                   f"（超過 {pp_stats['ffill_limit']} 天連續缺值，無法補值）。")
+                            if pp_stats["truncated_by"]:
+                                msg += f" 主因：**{pp_stats['truncated_by']}** 歷史較短。"
+                            st.warning(msg)
+
+                    st.dataframe(prices_df.tail(5).style.format("{:.2f}"), use_container_width=True)
 
                 except Exception as e:
                     st.error(f"❌ 檔案載入失敗：{e}")
@@ -298,7 +340,9 @@ with tab1:
             prices_local = {}
             for i, (name, s0) in enumerate(zip(all_names, all_s0)):
                 prices_local[name] = s0 * np.exp(np.cumsum(ret_sim[:, i]))
-            prices_df = pd.DataFrame(prices_local, index=dates)
+            prices_df_raw = pd.DataFrame(prices_local, index=dates)
+            prices_df, pp_stats = preprocess_prices(prices_df_raw, ffill_limit=5)
+            st.session_state["preprocess_stats"] = pp_stats
 
             # 模擬 FX 歷史（USD/TWD、KRW/TWD）
             fx_mu_usd, fx_sig_usd = 0.0000, 0.003
@@ -639,6 +683,61 @@ if (st.session_state.get("run_calc")
                     spot_fx=spot_fx,
                 )
 
+                # ── 有效 T 檢查 ──────────────────────────────────
+                _eff_T = len(calc.returns)
+                _conf  = params["confidence"]
+                _lb    = params["lookback"]
+                _actual_T = min(_eff_T, _lb)   # lookback 可能比 eff_T 短
+                _min_tail = max(1, int(np.ceil(1 / (1 - _conf))))  # 尾端至少 1 筆
+
+                _t_col1, _t_col2 = st.columns([3, 1])
+                with _t_col1:
+                    if _actual_T < _min_tail:
+                        st.error(
+                            f"❌ **資料不足**：有效回報筆數 T = **{_actual_T}**，"
+                            f"但 {_conf*100:.0f}% VaR 至少需要 **{_min_tail}** 筆（尾端才有觀測值）。"
+                            " 請擴充歷史資料或降低信賴水準。"
+                        )
+                    elif _actual_T < 100:
+                        st.error(
+                            f"🔴 **觀測數極少**（T = {_actual_T}）：結果高度不穩定，"
+                            f"強烈建議至少 100 筆以上的歷史資料。"
+                        )
+                    elif _actual_T < 250:
+                        st.warning(
+                            f"⚠️ 有效回報筆數 T = **{_actual_T}**（< Basel III 建議的 250 筆）。"
+                            " 計算結果仍可參考，但低估尾端風險的可能性較高。"
+                        )
+                    else:
+                        st.success(f"✅ 有效回報筆數 T = **{_actual_T}**（≥ 250，符合 Basel III 建議）")
+                with _t_col2:
+                    st.metric("實際使用 T", _actual_T,
+                              delta=f"{'⬆' if _actual_T >= 250 else '⬇'} Basel 建議 250",
+                              delta_color="normal" if _actual_T >= 250 else "inverse")
+
+                # ── 顯示前處理統計摘要（若有補值或截短）─────────
+                _pp = st.session_state.get("preprocess_stats")
+                if _pp and (_pp["any_filled"] or _pp["any_truncated"]):
+                    with st.expander("📋 資料前處理摘要（ffill 補值統計）", expanded=False):
+                        _rows = []
+                        for asset, s in _pp["per_asset"].items():
+                            if asset not in [p.name for p in positions]:
+                                continue
+                            _rows.append({
+                                "標的": asset,
+                                "資料起始": s["start_date"] or "—",
+                                "ffill 補值筆": s["filled"],
+                                "ffill 後仍缺": s["remaining_nulls"],
+                            })
+                        if _rows:
+                            st.dataframe(pd.DataFrame(_rows), hide_index=True,
+                                         use_container_width=True)
+                        st.caption(
+                            f"原始 {_pp['rows_before']} 列 → 清理後 {_pp['rows_after']} 列"
+                            f"（刪除 {_pp['dropped_rows']} 列全 NaN 或 ffill 後仍缺值的列）。"
+                            f" ffill 上限：{_pp['ffill_limit']} 個連續交易日。"
+                        )
+
                 if params["method"] == "Historical Simulation":
                     result = calc.historical(
                         confidence=params["confidence"],
@@ -689,6 +788,17 @@ with tab2:
         st.info("📌 請先在「資料匯入 & 部位設定」頁面執行計算")
     else:
         base_ccy = result.base_currency
+
+        # ── 幣別 → 市場標籤的反查（以使用者實際設定為準）──
+        _CCY_TO_MKT = {
+            "TWD": "台灣 🇹🇼", "USD": "美國 🇺🇸", "KRW": "韓國 🇰🇷",
+            "HKD": "香港 🇭🇰", "JPY": "日本 🇯🇵", "CNY": "中國 🇨🇳",
+        }
+        def _asset_market(name, currencies=None):
+            """從 result.asset_currencies 取實際幣別，再對應市場標籤。"""
+            _currencies = currencies or result.asset_currencies
+            ccy = _currencies.get(name, "")
+            return _CCY_TO_MKT.get(ccy, get_market_label(name))
 
         # ── 多市場幣別說明 ──
         if result.asset_currencies:
@@ -760,7 +870,7 @@ with tab2:
             marginal  = result.marginal_var.get(name, 0)
             comp_data.append({
                 "標的": name,
-                "市場": get_market_label(name),
+                "市場": _asset_market(name),
                 "幣別": ccy,
                 f"本地市值({ccy})": f"{local_mv:+,.0f}",
                 f"TWD 市值": f"{mv_base:+,.0f}",
@@ -933,7 +1043,7 @@ with tab3:
                     unsafe_allow_html=True)
         market_var = {}
         for name, cv in result.component_var.items():
-            mkt = get_market_label(name)
+            mkt = _asset_market(name)
             market_var[mkt] = market_var.get(mkt, 0) + abs(cv)
 
         fig_mkt = go.Figure(go.Bar(
@@ -1244,7 +1354,7 @@ with tab4:
                         ccy_a = hs.asset_currencies.get(name, base_ccy)
                         comp_compare_rows.append({
                             "標的": name,
-                            "市場": get_market_label(name),
+                            "市場": _asset_market(name, hs.asset_currencies),
                             "幣別": ccy_a,
                             f"HS CVaR({base_ccy})":    f"{hs.component_var[name]:,.0f}",
                             f"Param CVaR({base_ccy})":  f"{par.component_var[name]:,.0f}",

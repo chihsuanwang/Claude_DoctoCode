@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import var_engine; import var_app\")"
+    ]
+  }
+}
