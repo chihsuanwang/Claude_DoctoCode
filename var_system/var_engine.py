@@ -24,6 +24,7 @@ var_engine.py — 市場風險值（VaR）核心計算引擎
   - RiskMetrics™ Technical Document (1996). J.P. Morgan.
 """
 
+import re
 import numpy as np
 import pandas as pd
 from scipy import stats
@@ -67,6 +68,10 @@ def detect_asset_currency(ticker: str) -> str:
     """
     依 Yahoo Finance ticker 後綴自動識別資產幣別。
 
+    支援格式：
+      純 ticker：       2330.TW、005930.KS、AAPL
+      顯示名稱(ticker)：台積電(2330.TW)、Samsung(005930.KS)
+
     規則：
       *.TW / *.TWO  → TWD（台灣）
       *.KS / *.KQ   → KRW（韓國）
@@ -80,8 +85,14 @@ def detect_asset_currency(ticker: str) -> str:
     str : 幣別代碼（'TWD', 'USD', 'KRW', ...）
     """
     t = ticker.strip()
+    # 若字串結尾為「)」，嘗試提取最後一組括號內的 ticker code
+    # 格式：「中文名稱(TICKER)」或「DisplayName(TICKER)」
+    m = re.search(r'\(([^()]+)\)\s*$', t)
+    if m:
+        t = m.group(1).strip()
+    t_upper = t.upper()
     for suffix, ccy in _SUFFIX_CURRENCY.items():
-        if t.upper().endswith(suffix.upper()):
+        if t_upper.endswith(suffix.upper()):
             return ccy
     return "USD"
 

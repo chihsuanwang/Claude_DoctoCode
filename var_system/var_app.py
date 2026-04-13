@@ -338,6 +338,13 @@ with tab1:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 
+    # ── 市場 ↔ 幣別對照（全域常數）──
+    MARKET_OPTIONS = ["台灣 🇹🇼", "美國 🇺🇸", "韓國 🇰🇷", "香港 🇭🇰", "日本 🇯🇵", "中國 🇨🇳"]
+    MARKET_TO_CCY  = {
+        "台灣 🇹🇼": "TWD", "美國 🇺🇸": "USD", "韓國 🇰🇷": "KRW",
+        "香港 🇭🇰": "HKD", "日本 🇯🇵": "JPY", "中國 🇨🇳": "CNY",
+    }
+
     # ── 部位輸入 ──
     with col_right:
         st.markdown('<div class="section-header">📋 部位設定（Position Entry）</div>',
@@ -345,12 +352,7 @@ with tab1:
 
         if prices_df is not None:
             available = list(prices_df.columns)
-
-            # 顯示各標的市場
-            market_tags = " | ".join(
-                f"{n}({get_market_label(n)})" for n in available
-            )
-            st.caption(f"已識別標的市場：{market_tags}")
+            st.caption("選擇標的後請確認「市場」欄正確，系統將依市場自動換算幣別與 TWD 市值。")
             st.divider()
 
             st.markdown("**方式一：表格直接輸入**")
@@ -359,7 +361,7 @@ with tab1:
                 {
                     "標的名稱": name,
                     "持有數量": 100,
-                    "幣別": detect_asset_currency(name),
+                    "市場": get_market_label(name),   # 依 ticker 自動識別，使用者可覆蓋
                 }
                 for name in available[:6]
             ]
@@ -380,10 +382,10 @@ with tab1:
                         format="%d",
                         required=True,
                     ),
-                    "幣別": st.column_config.SelectboxColumn(
-                        "幣別",
-                        options=["TWD", "USD", "KRW", "HKD", "JPY", "CNY"],
-                        help="系統依 ticker 自動識別，可手動覆蓋",
+                    "市場": st.column_config.SelectboxColumn(
+                        "市場（決定幣別）",
+                        options=MARKET_OPTIONS,
+                        help="台灣→TWD｜美國→USD｜韓國→KRW｜香港→HKD｜日本→JPY",
                         required=True,
                     ),
                 },
@@ -392,14 +394,14 @@ with tab1:
             )
 
             st.markdown("**方式二：上傳部位 CSV**")
-            st.caption("格式：標的名稱, 持有數量, 幣別")
+            st.caption("格式：標的名稱, 持有數量, 市場")
 
-            # 下載範例 CSV（含幣別欄位）
+            # 下載範例 CSV（含市場欄位）
             _s_names = list(available[:min(4, len(available))])
             _sample_df = pd.DataFrame({
                 "標的名稱": _s_names,
                 "持有數量": [100, -50, 200, 300][:len(_s_names)],
-                "幣別": [detect_asset_currency(n) for n in _s_names],
+                "市場": [get_market_label(n) for n in _s_names],
             })
             _csv_bytes = _sample_df.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
@@ -414,8 +416,16 @@ with tab1:
             if pos_file:
                 pos_csv = pd.read_csv(pos_file)
                 if {"標的名稱", "持有數量"}.issubset(pos_csv.columns):
-                    if "幣別" not in pos_csv.columns:
-                        pos_csv["幣別"] = pos_csv["標的名稱"].apply(detect_asset_currency)
+                    # 相容舊版 CSV（有「幣別」欄但無「市場」欄）
+                    if "市場" not in pos_csv.columns:
+                        if "幣別" in pos_csv.columns:
+                            # 幣別反查市場標籤
+                            _ccy_to_mkt = {v: k for k, v in MARKET_TO_CCY.items()}
+                            pos_csv["市場"] = pos_csv["幣別"].map(
+                                lambda c: _ccy_to_mkt.get(str(c).upper(), get_market_label(c))
+                            )
+                        else:
+                            pos_csv["市場"] = pos_csv["標的名稱"].apply(get_market_label)
                     position_df = pos_csv
                     st.success(f"✅ 已匯入 {len(pos_csv)} 筆部位")
                 else:
@@ -426,23 +436,23 @@ with tab1:
             if not position_df.empty:
                 st.markdown("**部位市值彙整（以 TWD 計）：**")
                 latest = prices_df.iloc[-1]
-                # 取得即期匯率（優先取 session state 中使用者設定的值）
                 _spot = st.session_state.get("spot_fx_input", {
                     "USD": 32.5, "KRW": 0.0235, "HKD": 4.15, "JPY": 0.22, "TWD": 1.0
                 })
                 summary = []
                 for _, row in position_df.iterrows():
-                    name = row["標的名稱"]
-                    qty  = float(row["持有數量"])
-                    ccy  = str(row.get("幣別", detect_asset_currency(name)))
+                    name   = row["標的名稱"]
+                    qty    = float(row["持有數量"])
+                    market = str(row.get("市場", get_market_label(name)))
+                    ccy    = MARKET_TO_CCY.get(market, detect_asset_currency(name))
                     if name in latest.index and qty != 0:
                         local_price = latest[name]
-                        fx_rate = _spot.get(ccy, 1.0)
+                        fx_rate  = _spot.get(ccy, 1.0)
                         local_mv = qty * local_price
                         twd_mv   = local_mv * fx_rate
                         summary.append({
                             "標的": name,
-                            "市場": get_market_label(name),
+                            "市場": market,
                             "幣別": ccy,
                             f"本地價格({ccy})": f"{local_price:,.2f}",
                             "持有數量": f"{qty:+,.0f}",
@@ -593,12 +603,23 @@ if (st.session_state.get("run_calc")
     fx_prices  = st.session_state.get("fx_prices_df")
     spot_fx    = params.get("spot_fx", {})
 
-    # 建立 Position 物件（帶幣別）
+    # 建立 Position 物件（幣別從「市場」欄推導，向下相容「幣別」欄）
+    _MARKET_TO_CCY = {
+        "台灣 🇹🇼": "TWD", "美國 🇺🇸": "USD", "韓國 🇰🇷": "KRW",
+        "香港 🇭🇰": "HKD", "日本 🇯🇵": "JPY", "中國 🇨🇳": "CNY",
+    }
     positions = []
     for _, row in pos_df.iterrows():
-        name = str(row["標的名稱"])
-        qty  = float(row["持有數量"])
-        ccy  = str(row.get("幣別", detect_asset_currency(name)))
+        name   = str(row["標的名稱"])
+        qty    = float(row["持有數量"])
+        market = str(row.get("市場", ""))
+        # 優先順序：市場欄 → 幣別欄 → ticker 自動識別
+        if market in _MARKET_TO_CCY:
+            ccy = _MARKET_TO_CCY[market]
+        elif "幣別" in pos_df.columns and str(row.get("幣別", "")) in _MARKET_TO_CCY.values():
+            ccy = str(row["幣別"])
+        else:
+            ccy = detect_asset_currency(name)
         if name in prices_df.columns and qty != 0:
             positions.append(Position(name=name, quantity=qty, currency=ccy))
 
@@ -1105,41 +1126,220 @@ with tab4:
 
         # ── 三方法比較 ──
         st.markdown(
-            '<div class="section-header">🔄 三方法 VaR 比較</div>',
+            '<div class="section-header">🔄 三方法 VaR 完整平行比較</div>',
             unsafe_allow_html=True,
         )
-        if st.button("執行三方法比較"):
-            with st.spinner("比較計算中..."):
+
+        # 讓使用者調整 MC 路徑數（比較用）
+        cmp_col1, cmp_col2 = st.columns([1, 3])
+        with cmp_col1:
+            cmp_n_sims = st.select_slider(
+                "MC 模擬路徑數（比較用）",
+                options=[1000, 5000, 10000, 50000],
+                value=10000,
+                key="cmp_n_sims",
+            )
+
+        if st.button("執行三方法完整比較", type="secondary"):
+            with st.spinner("三方法計算中..."):
                 try:
-                    hs  = calc.historical(result.confidence, result.horizon)
-                    par = calc.parametric(result.confidence, result.horizon)
-                    mc  = calc.monte_carlo(result.confidence, result.horizon, n_sims=5000)
+                    params_now = st.session_state.get("calc_params", {})
+                    lkb  = params_now.get("lookback", 252)
+                    conf = result.confidence
+                    hz   = result.horizon
+                    rtype = params_now.get("return_type", "log")
+                    ewma_on  = params_now.get("use_ewma", False)
+                    ewma_lam = params_now.get("ewma_lam", 0.94)
 
-                    compare = pd.DataFrame({
-                        "方法": ["Historical Simulation", "Parametric (Delta-Normal)", "Monte Carlo"],
-                        f"VaR（{base_ccy}）":  [f"{hs.portfolio_var:,.2f}",
-                                                 f"{par.portfolio_var:,.2f}",
-                                                 f"{mc.portfolio_var:,.2f}"],
-                        f"CVaR（{base_ccy}）": [f"{hs.portfolio_cvar:,.2f}",
-                                                  f"{par.portfolio_cvar:,.2f}",
-                                                  f"{mc.portfolio_cvar:,.2f}"],
-                        "分散化比率": [f"{hs.diversification_ratio*100:.2f}%",
-                                       f"{par.diversification_ratio*100:.2f}%",
-                                       f"{mc.diversification_ratio*100:.2f}%"],
-                    })
-                    st.dataframe(compare, use_container_width=True, hide_index=True)
+                    hs  = calc.historical(conf, hz, lkb)
+                    par = calc.parametric(conf, hz, lkb)
+                    mc  = calc.monte_carlo(conf, hz, cmp_n_sims, lkb)
 
-                    fig_compare = go.Figure(go.Bar(
-                        x=["HS", "Parametric", "Monte Carlo"],
-                        y=[hs.portfolio_var, par.portfolio_var, mc.portfolio_var],
-                        marker_color=["steelblue", "coral", "seagreen"],
-                        text=[f"{v:,.0f}" for v in [hs.portfolio_var, par.portfolio_var, mc.portfolio_var]],
-                        textposition="auto",
-                    ))
-                    fig_compare.update_layout(
-                        title=f"三方法 VaR 比較（CI={result.confidence*100:.0f}%，{result.horizon}日，{base_ccy}）",
-                        yaxis_title=f"VaR（{base_ccy}）", height=320,
+                    # ── 1. 計算參數 & 進階設定平行欄 ──
+                    st.markdown("#### 計算參數 & 進階設定")
+                    hdr, c_hs, c_par, c_mc = st.columns([2, 1, 1, 1])
+                    hdr.markdown("**參數**")
+                    c_hs.markdown("**HS**")
+                    c_par.markdown("**Parametric**")
+                    c_mc.markdown("**Monte Carlo**")
+
+                    def _row(label, hs_v, par_v, mc_v):
+                        hdr.markdown(
+                            f"<span style='font-size:0.82rem;color:#aaa'>{label}</span>",
+                            unsafe_allow_html=True)
+                        for col, val in [(c_hs, hs_v), (c_par, par_v), (c_mc, mc_v)]:
+                            col.markdown(
+                                f"<span style='font-size:0.82rem;font-weight:600'>{val}</span>",
+                                unsafe_allow_html=True)
+
+                    _row("信賴水準",    f"{conf*100:.1f}%",  f"{conf*100:.1f}%",  f"{conf*100:.1f}%")
+                    _row("持有天數",    f"{hz} 天",           f"{hz} 天",           f"{hz} 天")
+                    _row("歷史回溯",    f"{lkb} 日",          f"{lkb} 日",          f"{lkb} 日")
+                    _row("回報計算",    rtype,                rtype,                rtype)
+                    _row("分布假設",    "非參數（實際）",      "常態分布",           "常態模擬")
+                    _row("EWMA",       "✓" if ewma_on else "✗", "✓" if ewma_on else "✗", "✓" if ewma_on else "✗")
+                    _row("EWMA λ",     f"{ewma_lam}" if ewma_on else "—",
+                                       f"{ewma_lam}" if ewma_on else "—",
+                                       f"{ewma_lam}" if ewma_on else "—")
+                    _row("模擬路徑數",  "—",                  "—",                  f"{cmp_n_sims:,}")
+                    _row("共變異數法",  "歷史（非參數）",      "EWMA" if ewma_on else "樣本",
+                                       "EWMA" if ewma_on else "樣本")
+
+                    st.divider()
+
+                    # ── 2. 組合級結果平行欄 ──
+                    st.markdown("#### 組合風險指標")
+                    hdr2, c_hs2, c_par2, c_mc2 = st.columns([2, 1, 1, 1])
+                    hdr2.markdown("**指標**")
+                    c_hs2.markdown("**HS**")
+                    c_par2.markdown("**Parametric**")
+                    c_mc2.markdown("**Monte Carlo**")
+
+                    def _row2(label, hs_v, par_v, mc_v, highlight=False):
+                        color = "#FFD700" if highlight else "inherit"
+                        hdr2.markdown(
+                            f"<span style='font-size:0.82rem;color:#aaa'>{label}</span>",
+                            unsafe_allow_html=True)
+                        for col, val in [(c_hs2, hs_v), (c_par2, par_v), (c_mc2, mc_v)]:
+                            col.markdown(
+                                f"<span style='font-size:0.85rem;font-weight:700;color:{color}'>{val}</span>",
+                                unsafe_allow_html=True)
+
+                    _row2(f"VaR（{base_ccy}）",
+                          f"{hs.portfolio_var:,.0f}",
+                          f"{par.portfolio_var:,.0f}",
+                          f"{mc.portfolio_var:,.0f}", highlight=True)
+                    _row2(f"CVaR / ES（{base_ccy}）",
+                          f"{hs.portfolio_cvar:,.0f}",
+                          f"{par.portfolio_cvar:,.0f}",
+                          f"{mc.portfolio_cvar:,.0f}", highlight=True)
+                    _row2("VaR %（市值）",
+                          f"{hs.portfolio_var/hs.portfolio_value*100:.3f}%",
+                          f"{par.portfolio_var/par.portfolio_value*100:.3f}%",
+                          f"{mc.portfolio_var/mc.portfolio_value*100:.3f}%")
+                    _row2("CVaR / VaR 倍數",
+                          f"{hs.portfolio_cvar/hs.portfolio_var:.3f}x" if hs.portfolio_var else "—",
+                          f"{par.portfolio_cvar/par.portfolio_var:.3f}x" if par.portfolio_var else "—",
+                          f"{mc.portfolio_cvar/mc.portfolio_var:.3f}x" if mc.portfolio_var else "—")
+                    _row2(f"損益標準差（{base_ccy}）",
+                          f"{hs.portfolio_pnl_std:,.0f}",
+                          f"{par.portfolio_pnl_std:,.0f}",
+                          f"{mc.portfolio_pnl_std:,.0f}")
+                    _row2("分散化比率",
+                          f"{hs.diversification_ratio*100:.2f}%",
+                          f"{par.diversification_ratio*100:.2f}%",
+                          f"{mc.diversification_ratio*100:.2f}%")
+                    _row2(f"分散化節省（{base_ccy}）",
+                          f"{max(0, sum(abs(v) for v in hs.component_var.values())  - hs.portfolio_var):,.0f}",
+                          f"{max(0, sum(abs(v) for v in par.component_var.values()) - par.portfolio_var):,.0f}",
+                          f"{max(0, sum(abs(v) for v in mc.component_var.values())  - mc.portfolio_var):,.0f}")
+
+                    st.divider()
+
+                    # ── 3. 個別資產 Component VaR 平行表 ──
+                    st.markdown("#### 個別資產 Component VaR 對照")
+                    asset_names = list(hs.component_var.keys())
+                    comp_compare_rows = []
+                    for name in asset_names:
+                        ccy_a = hs.asset_currencies.get(name, base_ccy)
+                        comp_compare_rows.append({
+                            "標的": name,
+                            "市場": get_market_label(name),
+                            "幣別": ccy_a,
+                            f"HS CVaR({base_ccy})":    f"{hs.component_var[name]:,.0f}",
+                            f"Param CVaR({base_ccy})":  f"{par.component_var[name]:,.0f}",
+                            f"MC CVaR({base_ccy})":     f"{mc.component_var[name]:,.0f}",
+                            "HS 貢獻%":   f"{hs.component_var[name]/hs.portfolio_var*100:.1f}%"
+                                           if hs.portfolio_var else "—",
+                            "Param 貢獻%": f"{par.component_var[name]/par.portfolio_var*100:.1f}%"
+                                           if par.portfolio_var else "—",
+                            "MC 貢獻%":    f"{mc.component_var[name]/mc.portfolio_var*100:.1f}%"
+                                           if mc.portfolio_var else "—",
+                        })
+                    st.dataframe(
+                        pd.DataFrame(comp_compare_rows),
+                        use_container_width=True, hide_index=True,
                     )
-                    st.plotly_chart(fig_compare, use_container_width=True)
+
+                    # ── 4. VaR & CVaR 並排長條圖 ──
+                    st.markdown("#### VaR / CVaR 視覺比較")
+                    fig_cmp = make_subplots(
+                        rows=1, cols=2,
+                        subplot_titles=(
+                            f"VaR（{base_ccy}）",
+                            f"CVaR / ES（{base_ccy}）",
+                        ),
+                    )
+                    methods_lbl = ["HS", "Parametric", "MC"]
+                    colors      = ["steelblue", "coral", "seagreen"]
+                    var_vals  = [hs.portfolio_var,  par.portfolio_var,  mc.portfolio_var]
+                    cvar_vals = [hs.portfolio_cvar, par.portfolio_cvar, mc.portfolio_cvar]
+
+                    fig_cmp.add_trace(go.Bar(
+                        x=methods_lbl, y=var_vals,
+                        marker_color=colors,
+                        text=[f"{v:,.0f}" for v in var_vals],
+                        textposition="auto", name="VaR", showlegend=False,
+                    ), row=1, col=1)
+                    fig_cmp.add_trace(go.Bar(
+                        x=methods_lbl, y=cvar_vals,
+                        marker_color=colors,
+                        text=[f"{v:,.0f}" for v in cvar_vals],
+                        textposition="auto", name="CVaR", showlegend=False,
+                    ), row=1, col=2)
+                    fig_cmp.update_layout(height=360, bargap=0.3)
+                    st.plotly_chart(fig_cmp, use_container_width=True)
+
+                    # ── 5. 可下載的完整比較 Excel ──
+                    xl_buf = io.BytesIO()
+                    with pd.ExcelWriter(xl_buf, engine="openpyxl") as xw:
+                        # 參數頁
+                        pd.DataFrame({
+                            "參數":      ["信賴水準", "持有天數", "歷史回溯", "回報計算",
+                                          "分布假設", "EWMA", "EWMA λ", "模擬路徑數"],
+                            "HS":        [f"{conf*100:.1f}%", hz, lkb, rtype,
+                                          "非參數", "是" if ewma_on else "否",
+                                          ewma_lam if ewma_on else "—", "—"],
+                            "Parametric":[f"{conf*100:.1f}%", hz, lkb, rtype,
+                                          "常態", "是" if ewma_on else "否",
+                                          ewma_lam if ewma_on else "—", "—"],
+                            "Monte Carlo":[f"{conf*100:.1f}%", hz, lkb, rtype,
+                                           "常態模擬", "是" if ewma_on else "否",
+                                           ewma_lam if ewma_on else "—", cmp_n_sims],
+                        }).to_excel(xw, sheet_name="計算參數", index=False)
+                        # 結果頁
+                        pd.DataFrame({
+                            "指標": [f"VaR({base_ccy})", f"CVaR({base_ccy})",
+                                     "VaR%", "CVaR/VaR",
+                                     f"損益標準差({base_ccy})", "分散化比率",
+                                     f"分散化節省({base_ccy})"],
+                            "HS":  [hs.portfolio_var, hs.portfolio_cvar,
+                                    hs.portfolio_var/hs.portfolio_value,
+                                    hs.portfolio_cvar/hs.portfolio_var,
+                                    hs.portfolio_pnl_std, hs.diversification_ratio,
+                                    max(0, sum(abs(v) for v in hs.component_var.values()) - hs.portfolio_var)],
+                            "Parametric": [par.portfolio_var, par.portfolio_cvar,
+                                           par.portfolio_var/par.portfolio_value,
+                                           par.portfolio_cvar/par.portfolio_var,
+                                           par.portfolio_pnl_std, par.diversification_ratio,
+                                           max(0, sum(abs(v) for v in par.component_var.values()) - par.portfolio_var)],
+                            "Monte Carlo": [mc.portfolio_var, mc.portfolio_cvar,
+                                            mc.portfolio_var/mc.portfolio_value,
+                                            mc.portfolio_cvar/mc.portfolio_var,
+                                            mc.portfolio_pnl_std, mc.diversification_ratio,
+                                            max(0, sum(abs(v) for v in mc.component_var.values()) - mc.portfolio_var)],
+                        }).to_excel(xw, sheet_name="組合指標", index=False)
+                        pd.DataFrame(comp_compare_rows).to_excel(
+                            xw, sheet_name="資產分解", index=False)
+
+                    st.download_button(
+                        "⬇️ 下載三方法完整比較 Excel",
+                        data=xl_buf.getvalue(),
+                        file_name=f"VaR_三方法比較_CI{int(conf*100)}_H{hz}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+
                 except Exception as e:
                     st.error(f"比較計算失敗：{e}")
+                    import traceback
+                    st.code(traceback.format_exc())
