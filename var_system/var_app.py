@@ -55,8 +55,9 @@ st.markdown("""
         font-size: 0.95rem; color: #666; margin-bottom: 1.5rem;
     }
     .metric-box {
-        background: #f0f4fa; border-radius: 8px;
-        padding: 1rem 1.2rem; border-left: 4px solid #1F497D;
+        background: transparent; border-radius: 8px;
+        border: 1px solid #1F497D; border-left: 4px solid #1F497D;
+        padding: 1rem 1.2rem;
     }
     .metric-label { font-size: 0.8rem; color: #555; font-weight: 600; }
     .metric-value { font-size: 1.6rem; font-weight: 800; color: #C00000; }
@@ -67,19 +68,22 @@ st.markdown("""
         margin-top: 1.5rem; margin-bottom: 0.8rem;
     }
     .warning-box {
-        background: #FFF3CD; border-left: 4px solid #FF9800;
+        background: transparent; border: 1px solid #FF9800;
+        border-left: 4px solid #FF9800;
         padding: 0.7rem 1rem; border-radius: 4px;
-        font-size: 0.85rem; color: #555;
+        font-size: 0.85rem; color: inherit;
     }
     .success-box {
-        background: #E8F5E9; border-left: 4px solid #4CAF50;
+        background: transparent; border: 1px solid #4CAF50;
+        border-left: 4px solid #4CAF50;
         padding: 0.7rem 1rem; border-radius: 4px;
-        font-size: 0.85rem;
+        font-size: 0.85rem; color: inherit;
     }
     .info-box {
-        background: #E3F2FD; border-left: 4px solid #2196F3;
+        background: transparent; border: 1px solid #2196F3;
+        border-left: 4px solid #2196F3;
         padding: 0.7rem 1rem; border-radius: 4px;
-        font-size: 0.85rem;
+        font-size: 0.85rem; color: inherit;
     }
     div[data-testid="stDataFrame"] { border-radius: 8px; }
 </style>
