@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -c \"import var_engine; import var_app\")"
+      "Bash(python -c \"import var_engine; import var_app\")",
+      "Bash(python create_var_verification.py)",
+      "Bash(python test_var_vs_excel.py)"
     ]
   }
 }

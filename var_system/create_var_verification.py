@@ -1,15 +1,34 @@
 """
-create_var_verification.py  v2
+create_var_verification.py  v3
 ==========================
 產生「VaR 三方法逐步驗證 Excel」，供人工核對每一步計算。
 
 v1 → v2 修正：
   1. 修正回報起點：LOCAL_RET 改從 ALL_PRICES（含 S0）計算
-     舊：diff(PRICES[0..39]) → 回報 1..39，與日期差一格
-     新：diff([S0]+PRICES[0..N-1]) → 回報 0..N-1，正確對齊
   2. N_DAYS 改為 250（標準 1 年），99% VaR 有 2 個尾端觀測
   3. Sheet 3 全面使用 Excel 公式（LN 直接引用 Sheet 2 原始價格）
   4. Sheet 4 排序欄位使用 SMALL() 公式，VaR/CVaR 結果格亦為公式
+
+v2 → v3 修正（公式完全揭露）：
+  5. Sheet 5（Parametric）全面改用 Excel 公式：
+       - Σ 矩陣：COVARIANCE.S() 公式，引用 Sheet 3 G/H/I 欄回報序列
+       - ρ 矩陣：= Σ[i,j]/SQRT(Σ[i,i]*Σ[j,j]) 公式，引用 Σ 儲存格
+       - w 向量：引用 Sheet 1 G5:G7 市值
+       - Σw 向量：= Σ×w 展開公式，引用 Σ 和 w 儲存格
+       - σ²_P = w'Σw、σ_P = SQRT(σ²_P)：公式鏈
+       - z_α = NORM.S.INV(0.99)：公式
+       - VaR = z_α × σ_P、CVaR 全為公式
+       - Component VaR_i = w_i × z_α × (Σw)_i / σ_P：公式，加總驗證
+  6. Sheet 6（MC）全面改用 Excel 公式，N=500（可完整顯示所有路徑）：
+       - Cholesky L：公式引用 Sheet 5 Σ 儲存格
+       - L×L' 驗證：Excel 公式（應還原 Σ）
+       - μ：AVERAGE() 公式引用 Sheet 3 回報序列
+       - w：公式引用 Sheet 1
+       - z 亂數：seed=42 固定值揭露於 B/C/D 欄（500×3 共 1500 個值）
+       - r_sim：= L×z + μ 展開公式，引用 L、z、μ 儲存格
+       - P&L：= Σ w_i × r_sim_i 公式
+       - VaR = -SMALL(P&L, 6) 公式
+       - CVaR = -(SMALL(1)+...+SMALL(5))/5 公式
 """
 
 import numpy as np
@@ -122,12 +141,7 @@ ASSETS = ["台積電(2330.TW)", "AAPL", "三星(005930.KS)"]
 # 日期序列：N_DAYS+1 個，D[0]=初始日，D[1..N_DAYS]=回報日
 DATES = pd.bdate_range(end="2024-12-31", periods=N_DAYS + 1)
 
-# ─────────────────────────────────────────────────────────────
 # 完整價格序列（含初始 S0）
-#   ALL_PRICES[k] = 第 k 日收盤價，對應 DATES[k]
-#   ALL_PRICES[0] = S0
-#   ALL_PRICES[1] = PRICES[0]  ← 第 1 個交易日
-# ─────────────────────────────────────────────────────────────
 ALL_PRICES = np.vstack([S0, PRICES])   # (N_DAYS+1, 3)
 ALL_FX     = np.vstack([FX0, FX])     # (N_DAYS+1, 2)
 
@@ -140,11 +154,7 @@ MV_BASE      = np.array([
 ])
 PORTFOLIO_VALUE = float(np.sum(MV_BASE))
 
-# ─────────────────────────────────────────────────────────────
-# 回報計算（修正：從 ALL_PRICES 計算，包含第一天 S0→PRICES[0]）
-#   LOCAL_RET[t] = ln(ALL_PRICES[t+1] / ALL_PRICES[t])
-#               = 日期 DATES[t+1] 的本地回報
-# ─────────────────────────────────────────────────────────────
+# 回報計算
 LOCAL_RET = np.diff(np.log(ALL_PRICES), axis=0)   # (N_DAYS, 3)
 FX_RET_TS = np.diff(np.log(ALL_FX),    axis=0)    # (N_DAYS, 2)
 
@@ -195,30 +205,41 @@ PAR_COMP_CVAR = {
     for n in ASSETS
 }
 
-# ─── Monte Carlo 計算 ─────────────────────────────────────────
+# ─── Monte Carlo 計算（MC_N=5000，用於 Sheet 7 比較）───────────
 MC_N = 5000
-RNG2 = np.random.default_rng(seed=42)
+RNG_FULL = np.random.default_rng(seed=42)
 try:
     L_MC = np.linalg.cholesky(COV_SAMPLE)
 except np.linalg.LinAlgError:
     L_MC = np.linalg.cholesky(COV_SAMPLE + np.eye(3) * 1e-8)
 
 MU_RET = ADJ_RET.mean(axis=0)
-Z_MC   = RNG2.standard_normal((MC_N, 3))
-SIM    = Z_MC @ L_MC.T + MU_RET
-PNL_MC = SIM @ MV_BASE
-MC_VAR  = float(-np.percentile(PNL_MC, (1 - CONFIDENCE) * 100))
-thr_mc  = np.percentile(PNL_MC, (1 - CONFIDENCE) * 100)
-MC_CVAR = float(-PNL_MC[PNL_MC <= thr_mc].mean())
+Z_MC_FULL = RNG_FULL.standard_normal((MC_N, 3))
+SIM_FULL  = Z_MC_FULL @ L_MC.T + MU_RET
+PNL_FULL  = SIM_FULL @ MV_BASE
+MC_VAR    = float(-np.percentile(PNL_FULL, (1 - CONFIDENCE) * 100))
+thr_full  = np.percentile(PNL_FULL, (1 - CONFIDENCE) * 100)
+MC_CVAR   = float(-PNL_FULL[PNL_FULL <= thr_full].mean())
 MC_COMP_VAR = {
-    ASSETS[i]: float(-np.percentile(SIM[:, i] * MV_BASE[i], (1 - CONFIDENCE) * 100))
+    ASSETS[i]: float(-np.percentile(SIM_FULL[:, i] * MV_BASE[i], (1 - CONFIDENCE) * 100))
     for i in range(3)
 }
-tail_mask = PNL_MC <= thr_mc
+tail_full = PNL_FULL <= thr_full
 MC_COMP_CVAR = {
-    ASSETS[i]: float(-((SIM[:, i] * MV_BASE[i])[tail_mask]).mean())
+    ASSETS[i]: float(-((SIM_FULL[:, i] * MV_BASE[i])[tail_full]).mean())
     for i in range(3)
 }
+
+# ─── Monte Carlo 計算（N_MC6=500，用於 Sheet 6 完整公式揭露）──
+N_MC6 = 500
+IDX_VAR_MC6 = int(np.floor((1 - CONFIDENCE) * N_MC6))  # = 5
+RNG_MC6 = np.random.default_rng(seed=42)   # 同樣 seed=42
+Z_MC6   = RNG_MC6.standard_normal((N_MC6, 3))
+SIM_MC6 = Z_MC6 @ L_MC.T + MU_RET
+PNL_MC6 = SIM_MC6 @ MV_BASE
+MC_VAR6 = float(-np.percentile(PNL_MC6, (1 - CONFIDENCE) * 100))
+thr_mc6 = np.percentile(PNL_MC6, (1 - CONFIDENCE) * 100)
+MC_CVAR6 = float(-PNL_MC6[PNL_MC6 <= thr_mc6].mean())
 
 # ─── Cholesky 手算（3×3）─────────────────────────────────────
 S = COV_SAMPLE
@@ -234,7 +255,9 @@ L[2, 2] = np.sqrt(S[2, 2] - L[2, 0] ** 2 - L[2, 1] ** 2)
 print(f"[設定] N_DAYS={N_DAYS}, T={T}, IDX_VAR={IDX_VAR}")
 print(f"  HS  VaR = {HS_VAR:>12,.2f} TWD  (第 {IDX_VAR+1} 小損益)")
 print(f"  Par VaR = {PAR_VAR:>12,.2f} TWD")
-print(f"  MC  VaR = {MC_VAR:>12,.2f} TWD")
+print(f"  MC  VaR (5000路徑) = {MC_VAR:>12,.2f} TWD")
+print(f"  MC  VaR (500路徑)  = {MC_VAR6:>12,.2f} TWD")
+print(f"  IDX_VAR_MC6 = {IDX_VAR_MC6}  (VaR = 第 {IDX_VAR_MC6+1} 小損益)")
 sum_cv = sum(PAR_COMP_VAR.values())
 print(f"  Parametric Component VaR 加總誤差：|{sum_cv:.4f} - {PAR_VAR:.4f}| = {abs(sum_cv-PAR_VAR):.6e}")
 
@@ -248,25 +271,94 @@ wb.remove(wb.active)
 S1 = "'①基本設定'"
 S2 = "'②原始價格與FX'"
 S3 = "'③回報計算FX調整'"
+S5 = "'⑤參數法Parametric'"   # Sheet 6 需要引用 Sheet 5 的 Σ
 
-# Sheet 2 資料列對應：
-#   ALL_PRICES[k] → Sheet2 row (k + S2_DATA_START)
-S2_DATA_START = 3   # ALL_PRICES[0]=S0 在 Sheet2 第 3 列
+# Sheet 2 資料列對應
+S2_DATA_START = 3
 
-# Sheet 3 資料列對應：
-#   ADJ_RET[row_i] → Sheet3 row (row_i + S3_DATA_START)
-S3_DATA_START = 16   # section at 14, headers at 15, data from 16
+# Sheet 3 資料列對應
+S3_DATA_START = 16
 S3_DATA_END   = S3_DATA_START + T - 1   # = 265
 
 # Sheet 4 資料列對應
 S4_DATA_START = 14
 S4_DATA_END   = S4_DATA_START + T - 1   # = 263
 
+# Sheet 3 adj return columns（G=台積電, H=AAPL, I=三星）
+ADJ_COLS = ['G', 'H', 'I']
+
+# Sheet 5 layout row constants
+S5_SIG_ROW  = 15   # Σ 矩陣資料列（rows 15-17，cols B-D）
+S5_RHO_ROW  = 21   # ρ 矩陣資料列（rows 21-23，cols B-D）
+S5_W_ROW    = 27   # w 向量（rows 27-29，col B）
+S5_SW_ROW   = 33   # Σw 向量（rows 33-35，col B）
+S5_SP2_ROW  = 37   # σ²_P 列，col B
+S5_SP_ROW   = 38   # σ_P 列，col B
+S5_ZA_ROW   = 42   # z_α 列，col B
+S5_VAR_ROW  = 44   # VaR 列，col B
+S5_CVAR_ROW = 45   # CVaR 列，col B
+S5_COMP_ROW = 51   # Component VaR 首列（rows 51-53，cols A-G）
+
+# Sheet 6 layout constants
+S6_L_ROW    = 14   # L 矩陣（rows 14-16，cols B-D）
+S6_LLT_ROW  = 20   # L×L' 驗證（rows 20-22，cols B-D）
+S6_MU_ROW   = 26   # μ 向量（rows 26-28，col B）
+S6_W_ROW    = 32   # w 向量（rows 32-34，col B）
+S6_DATA_START = 38                           # 模擬路徑首列
+S6_DATA_END   = S6_DATA_START + N_MC6 - 1   # = 537
+S6_VAR_ROW  = S6_DATA_END + 3               # = 540
+
+# ── 公式輔助函式 ──────────────────────────────────────────────
+
+def sig_addr(i, j):
+    """Sheet 5 內的 Σ[i,j] 儲存格位址（無 $ 符號）"""
+    return f"{chr(66+j)}{S5_SIG_ROW+i}"
+
+def sig_abs(i, j):
+    """Sheet 5 內的 Σ[i,j] 儲存格位址（含 $ 絕對引用）"""
+    return f"${chr(66+j)}${S5_SIG_ROW+i}"
+
+def s6_L_abs(i, j):
+    """Sheet 6 內的 L[i,j] 儲存格位址（絕對引用）"""
+    return f"${chr(66+j)}${S6_L_ROW+i}"
+
+def cov_formula(i, j):
+    """Σ[i,j] = COVARIANCE.S(adj_i_range, adj_j_range)"""
+    ri = f"{S3}!${ADJ_COLS[i]}${S3_DATA_START}:${ADJ_COLS[i]}${S3_DATA_END}"
+    rj = f"{S3}!${ADJ_COLS[j]}${S3_DATA_START}:${ADJ_COLS[j]}${S3_DATA_END}"
+    return f"=COVARIANCE.S({ri},{rj})"
+
+def rho_formula(i, j):
+    """ρ[i,j] = Σ[i,j] / SQRT(Σ[i,i]*Σ[j,j])，引用 Sheet 5 內的 Σ 儲存格"""
+    return f"={sig_addr(i,j)}/SQRT({sig_abs(i,i)}*{sig_abs(j,j)})"
+
+def llt_formula(i, j):
+    """(L×L')[i,j] = Σ_k L[i,k]*L[j,k]，引用 Sheet 6 內的 L 儲存格"""
+    k_max = min(i, j)
+    if i == j:
+        terms = [f"{s6_L_abs(i,k)}^2" for k in range(i+1)]
+    else:
+        terms = [f"{s6_L_abs(i,k)}*{s6_L_abs(j,k)}" for k in range(k_max+1)]
+    return "=" + "+".join(terms)
+
+def rsim_formula(asset_idx, row):
+    """r_sim[k, asset_idx] = L[asset_idx,0]*z0 + ... + L[asset_idx,asset_idx]*z_i + μ_i"""
+    terms = [f"{s6_L_abs(asset_idx,k)}*{chr(66+k)}{row}" for k in range(asset_idx+1)]
+    mu = f"$B${S6_MU_ROW+asset_idx}"
+    return "=" + "+".join(terms) + "+" + mu
+
+def pnl_formula_mc6(row):
+    """P&L = r_sim[台積電]*w[0] + r_sim[AAPL]*w[1] + r_sim[三星]*w[2]"""
+    rsim_cols = [chr(69+k) for k in range(3)]   # E, F, G
+    w_cells   = [f"$B${S6_W_ROW+k}" for k in range(3)]
+    terms = [f"{rsim_cols[k]}{row}*{w_cells[k]}" for k in range(3)]
+    return "=" + "+".join(terms)
+
 # ════════════════════════════════════════════════════════════
 # Sheet 1 — 基本設定
 # ════════════════════════════════════════════════════════════
 ws1 = wb.create_sheet("①基本設定")
-merge_hdr(ws1, 1, 1, 8, "VaR 逐步計算驗證 — 基本設定（v2）")
+merge_hdr(ws1, 1, 1, 8, "VaR 逐步計算驗證 — 基本設定（v3）")
 ws1.row_dimensions[1].height = 22
 
 section(ws1, 3, "資產與部位定義")
@@ -294,7 +386,7 @@ ws1.cell(8, 6, "組合總市值(TWD)").font = Font(bold=True, size=9)
 val(ws1, 8, 7, round(PORTFOLIO_VALUE, 0), fmt="#,##0", bold=True, bg=LYELL)
 apply_border(ws1, 4, 1, 8, 8)
 
-note(ws1, 9, 1, "★ G5:G7（TWD 市值）會被 Sheet 3 P&L 公式直接引用，請勿移動此欄位置。")
+note(ws1, 9, 1, "★ G5:G7（TWD 市值）會被 Sheet 3 P&L、Sheet 5 Parametric、Sheet 6 MC 公式直接引用，請勿移動此欄位置。G8 為組合總市值。")
 
 section(ws1, 11, "VaR 計算參數")
 params = [
@@ -307,7 +399,7 @@ params = [
     ("VaR 分位索引（HS）",      f"idx = floor((1-α)×T) = floor(0.01×{T}) = {IDX_VAR}"),
     ("HS VaR 公式",             f"-P&L_sorted[{IDX_VAR}]  （第 {IDX_VAR+1} 小損益）"),
     ("HS CVaR 公式",            f"-mean(P&L_sorted[0:{IDX_VAR}])  （最差 {max(IDX_VAR,1)} 筆均值）"),
-    ("MC 模擬路徑數",           f"{MC_N:,}"),
+    ("MC 展示路徑數",           f"{N_MC6:,}（seed=42，VaR=第{IDX_VAR_MC6+1}小損益）"),
 ]
 for r, (k, v) in enumerate(params, start=12):
     val(ws1, r, 1, k, bold=True, align="left")
@@ -343,16 +435,13 @@ for c, h in enumerate(["日期", "台積電(TWD)", "AAPL(USD)", "三星(KRW)",
 for row_i in range(N_DAYS + 1):
     r = row_i + S2_DATA_START
     val(ws2, r, 1, DATES[row_i].strftime("%Y-%m-%d"), align="center")
-    # 股價
     val(ws2, r, 2, round(float(ALL_PRICES[row_i, 0]), 2), fmt="#,##0.00")
     val(ws2, r, 3, round(float(ALL_PRICES[row_i, 1]), 2), fmt="#,##0.00")
     val(ws2, r, 4, round(float(ALL_PRICES[row_i, 2]), 0), fmt="#,##0")
-    # FX
     val(ws2, r, 6, DATES[row_i].strftime("%Y-%m-%d"), align="center")
     val(ws2, r, 7, round(float(ALL_FX[row_i, 0]), 4), fmt="#,##0.0000")
     val(ws2, r, 8, round(float(ALL_FX[row_i, 1]), 6), fmt="0.000000")
 
-# 初始列（S0）醒目標示
 for c in range(1, 9):
     ws2.cell(S2_DATA_START, c).fill = PatternFill("solid", fgColor=LYELL)
 
@@ -376,9 +465,9 @@ formulas_doc = [
     ("D欄 三星 r_local",    "=LN('②原始價格與FX'!D{t} / '②原始價格與FX'!D{t-1})"),
     ("E欄 USD r_FX",        "=LN('②原始價格與FX'!G{t} / '②原始價格與FX'!G{t-1})  ← G欄=USD/TWD"),
     ("F欄 KRW r_FX",        "=LN('②原始價格與FX'!H{t} / '②原始價格與FX'!H{t-1})  ← H欄=KRW/TWD"),
-    ("G欄 台積電 r_adj",    "=B{row}  （TWD 資產，r_adj = r_local）"),
-    ("H欄 AAPL r_adj",      "=C{row}+E{row}  （USD 資產，r_adj = r_local + r_FX）"),
-    ("I欄 三星 r_adj",      "=D{row}+F{row}  （KRW 資產，r_adj = r_local + r_FX）"),
+    ("G欄 台積電 r_adj",    "=B{row}  （TWD 資產，r_adj = r_local）← Sheet 5 COVARIANCE.S 引用此欄"),
+    ("H欄 AAPL r_adj",      "=C{row}+E{row}  （USD 資產，r_adj = r_local + r_FX）← Sheet 5 引用"),
+    ("I欄 三星 r_adj",      "=D{row}+F{row}  （KRW 資產，r_adj = r_local + r_FX）← Sheet 5 引用"),
     ("J欄 組合P&L",         "=G{row}*'①基本設定'!$G$5 + H{row}*'①基本設定'!$G$6 + I{row}*'①基本設定'!$G$7"),
     ("驗證方法",            "J欄 P&L = Σ(r_adj_i × MV_i)，與 Sheet4 HS VaR 計算的基礎相同"),
 ]
@@ -395,35 +484,23 @@ for c, h in enumerate(["日期",
                         "組合P&L(TWD)"], start=1):
     hdr(ws3, 15, c, h, bg="2E75B6")
 
-# 公式資料列
-# Sheet2 資料從 row S2_DATA_START 開始：
-#   ALL_PRICES[k]  → Sheet2 row (S2_DATA_START + k)
-#   ADJ_RET[row_i] = return from ALL_PRICES[row_i] to ALL_PRICES[row_i+1]
-#   date = DATES[row_i+1]
-#   Sheet2 "current" row = S2_DATA_START + (row_i+1) = row_i + S2_DATA_START + 1
-#   Sheet2 "prev"    row = S2_DATA_START + row_i
 for row_i in range(T):
-    r      = row_i + S3_DATA_START        # Sheet3 data row
-    p_curr = row_i + S2_DATA_START + 1   # Sheet2 current price row
-    p_prev = row_i + S2_DATA_START       # Sheet2 prev    price row
+    r      = row_i + S3_DATA_START
+    p_curr = row_i + S2_DATA_START + 1
+    p_prev = row_i + S2_DATA_START
 
     val(ws3, r, 1, DATES[row_i + 1].strftime("%Y-%m-%d"), align="center")
 
-    # r_local (B, C, D)
     ws3.cell(r, 2).value = f"=LN({S2}!B{p_curr}/{S2}!B{p_prev})"
     ws3.cell(r, 2).number_format = "0.000000"
     ws3.cell(r, 3).value = f"=LN({S2}!C{p_curr}/{S2}!C{p_prev})"
     ws3.cell(r, 3).number_format = "0.000000"
     ws3.cell(r, 4).value = f"=LN({S2}!D{p_curr}/{S2}!D{p_prev})"
     ws3.cell(r, 4).number_format = "0.000000"
-
-    # r_FX (E=USD, F=KRW)
     ws3.cell(r, 5).value = f"=LN({S2}!G{p_curr}/{S2}!G{p_prev})"
     ws3.cell(r, 5).number_format = "0.000000"
     ws3.cell(r, 6).value = f"=LN({S2}!H{p_curr}/{S2}!H{p_prev})"
     ws3.cell(r, 6).number_format = "0.000000"
-
-    # r_adj (G=TSMC, H=AAPL, I=Samsung)
     ws3.cell(r, 7).value = f"=B{r}"
     ws3.cell(r, 7).number_format = "0.000000"
     ws3.cell(r, 8).value = f"=C{r}+E{r}"
@@ -432,23 +509,18 @@ for row_i in range(T):
     ws3.cell(r, 9).value = f"=D{r}+F{r}"
     ws3.cell(r, 9).number_format = "0.000000"
     ws3.cell(r, 9).fill = PatternFill("solid", fgColor=LBLUE)
-
-    # P&L = Σ r_adj_i × MV_i（MV 在 Sheet1 G5:G7）
     ws3.cell(r, 10).value = (
         f"=G{r}*{S1}!$G$5"
         f"+H{r}*{S1}!$G$6"
         f"+I{r}*{S1}!$G$7"
     )
     ws3.cell(r, 10).number_format = "#,##0.00"
-
-    # 負損益醒目（用 Python 計算值判斷）
     pnl_py = float(PNL_HS[row_i])
     if pnl_py < 0:
         ws3.cell(r, 10).fill = PatternFill("solid", fgColor=LRED)
 
 apply_border(ws3, 15, 1, S3_DATA_END, 10)
 
-# 統計彙整（用 AVERAGE/STDEV 公式）
 r_avg = S3_DATA_END + 2
 r_std = S3_DATA_END + 3
 for r, lbl in [(r_avg, "平均"), (r_std, "標準差")]:
@@ -464,7 +536,7 @@ for r, lbl in [(r_avg, "平均"), (r_std, "標準差")]:
 note(ws3, S3_DATA_END + 5, 1,
      "藍色格（H, I）= FX 已疊加。"
      f"P&L 負值（紅色）共 {int(np.sum(PNL_HS < 0))} 筆。"
-     "所有數值均為 Excel 公式，可點入儲存格確認計算鏈。")
+     "G/H/I 欄回報序列被 Sheet 5 COVARIANCE.S 公式直接引用計算 Σ。")
 autofit(ws3)
 
 # ════════════════════════════════════════════════════════════
@@ -489,7 +561,6 @@ for r, (s, d) in enumerate(hs_steps, start=4):
     ws4.merge_cells(start_row=r, start_column=2, end_row=r, end_column=9)
     val(ws4, r, 2, d, align="left")
 
-# 表頭
 section(ws4, 11, f"組合損益序列 & 排序（T={T}，全為公式引用）")
 ws4.merge_cells(start_row=12, start_column=1, end_row=12, end_column=4)
 ws4.cell(12, 1, "▶ 原始損益（時間序列，引用 Sheet 3 J 欄）").font = Font(bold=True, color="FFFFFF")
@@ -503,13 +574,10 @@ for c, h in enumerate(["排名", "日期", "原始P&L（引用Sheet3）", ""], s
 for c, h in enumerate(["排名", "排序P&L＝SMALL()", "說明", ""], start=6):
     hdr(ws4, 13, c, h, bg=GREEN)
 
-# PNL 公式範圍（供 SMALL 公式使用）
 pnl_range = f"{S3}!$J${S3_DATA_START}:$J${S3_DATA_END}"
 
 for row_i in range(T):
     r = row_i + S4_DATA_START
-
-    # 時序區（B, C 欄）
     val(ws4, r, 1, row_i + 1)
     val(ws4, r, 2, DATES[row_i + 1].strftime("%Y-%m-%d"), align="center")
     ws4.cell(r, 3).value = f"={S3}!J{row_i + S3_DATA_START}"
@@ -518,7 +586,6 @@ for row_i in range(T):
     if pnl_py < 0:
         ws4.cell(r, 3).fill = PatternFill("solid", fgColor=LRED)
 
-    # 排序區（H, I 欄）— SMALL() 公式
     rank = row_i + 1
     val(ws4, r, 6, rank)
     ws4.cell(r, 7).value = f"=SMALL({pnl_range},{rank})"
@@ -537,13 +604,10 @@ for row_i in range(T):
 apply_border(ws4, 13, 1, S4_DATA_END, 4)
 apply_border(ws4, 13, 6, S4_DATA_END, 9)
 
-# 結果區（VaR/CVaR 亦為公式）
 rr = S4_DATA_END + 3
 section(ws4, rr, "HS 計算結果（黃色格為公式，可點入驗證）")
 
-# VaR formula: -SMALL(pnl_range, IDX_VAR+1)
 var_formula_str  = f"=-SMALL({pnl_range},{IDX_VAR+1})"
-# CVaR formula: average of IDX_VAR worst (if IDX_VAR==0, use 1 worst)
 if IDX_VAR <= 0:
     cvar_formula_str = f"=-SMALL({pnl_range},1)"
 else:
@@ -564,7 +628,6 @@ for row, lbl, formula_or_val, fmt in result_rows:
     c.font = Font(bold=True, size=9)
     c.fill = PatternFill("solid", fgColor=LYELL)
 
-# Component VaR
 section(ws4, rr + 8, "Component VaR（HS）")
 for c, h in enumerate(["資產", "Component VaR(TWD)", "Component CVaR(TWD)", "風險貢獻%"], start=1):
     hdr(ws4, rr + 9, c, h, bg="2E75B6")
@@ -579,203 +642,498 @@ note(ws4, rr + 14, 1,
 autofit(ws4)
 
 # ════════════════════════════════════════════════════════════
-# Sheet 5 — Parametric VaR
+# Sheet 5 — Parametric VaR（全公式計算鏈）
 # ════════════════════════════════════════════════════════════
 ws5 = wb.create_sheet("⑤參數法Parametric")
-merge_hdr(ws5, 1, 1, 12, "步驟三（Parametric）：Delta-Normal VaR 逐步計算")
+merge_hdr(ws5, 1, 1, 12,
+          "步驟三（Parametric）：Delta-Normal VaR — 全公式計算鏈（點入任一黃/藍色格確認公式）")
 
-section(ws5, 3, "方法說明 & 公式")
+section(ws5, 3, "計算步驟（每格均為 Excel 公式，可點入確認計算鏈）")
 par_steps = [
-    ("Step 1", f"計算 FX 調整後回報的樣本共變異數矩陣 Σ（基於 T={T} 筆回報）"),
-    ("Step 2", "組合方差：σ²_P = w'Σw，w = TWD 市值向量"),
-    ("Step 3", f"組合日標準差：σ_P = √(w'Σw) = {PORT_STD:,.4f} TWD"),
-    ("Step 4", f"z_α = NORM.S.INV({CONFIDENCE}) = {Z_ALPHA:.6f}"),
-    ("Step 5", f"VaR = z_α × σ_P = {Z_ALPHA:.4f} × {PORT_STD:,.4f} = {PAR_VAR:,.2f} TWD"),
-    ("Step 6", f"CVaR = φ(z_α)/(1-α) × σ_P = {norm.pdf(Z_ALPHA):.6f}/0.01 × {PORT_STD:,.4f} = {PAR_CVAR:,.2f} TWD"),
-    ("Step 7", "Component VaR_i = w_i × (Σw)_i / σ_P × z_α  ← 精確可加分解"),
-    ("驗證",   "Σ Component VaR_i = Portfolio VaR（代數精確，見下方驗證列）"),
+    ("Step 1", f"Σ 矩陣 = COVARIANCE.S()，引用 Sheet 3 G/H/I 欄（{T} 筆 FX 調整後回報）"),
+    ("Step 2", "ρ[i,j] = Σ[i,j] / SQRT(Σ[i,i]×Σ[j,j])，公式引用上方 Σ 儲存格"),
+    ("Step 3", "w 向量 = Sheet 1 G5:G7 TWD 市值（公式引用）"),
+    ("Step 4", "(Σw)[i] = Σ[i,0]×w[0]+Σ[i,1]×w[1]+Σ[i,2]×w[2]，展開公式"),
+    ("Step 5", "σ²_P = w'Σw = Σ_i w[i]×(Σw)[i]；σ_P = SQRT(σ²_P)"),
+    ("Step 6", "z_α = NORM.S.INV(0.99)"),
+    ("Step 7", "VaR = z_α × σ_P；CVaR = NORM.DIST(-z_α,0,1,FALSE)/0.01 × σ_P"),
+    ("Step 8", "Component VaR_i = w_i × z_α × (Σw)_i / σ_P；加總 = Portfolio VaR（代數精確）"),
 ]
 for r, (s, d) in enumerate(par_steps, start=4):
-    bg = LGREEN if s == "驗證" else None
-    val(ws5, r, 1, s, bold=True, bg=LBLUE if bg is None else LGREEN)
+    val(ws5, r, 1, s, bold=True, bg=LBLUE)
     ws5.merge_cells(start_row=r, start_column=2, end_row=r, end_column=10)
     val(ws5, r, 2, d, align="left")
 
-section(ws5, 13, "共變異數矩陣 Σ（樣本）")
+# ── ① 共變異數矩陣 Σ（COVARIANCE.S 公式）─────────────────────
+section(ws5, 12, f"① 共變異數矩陣 Σ（COVARIANCE.S，引用 Sheet 3 G/H/I 欄，T={T} 筆）")
+note(ws5, 13, 1,
+     f"公式範本（Σ[0,0]）：=COVARIANCE.S({S3}!$G${S3_DATA_START}:$G${S3_DATA_END},"
+     f"{S3}!$G${S3_DATA_START}:$G${S3_DATA_END})  ← 點入 B15 儲存格可見完整公式")
+
 for c, h in enumerate([""] + ASSETS, start=1):
     hdr(ws5, 14, c, h, bg="2E75B6")
-for i in range(3):
-    val(ws5, 15 + i, 1, ASSETS[i], bold=True, align="left", bg=LGRAY)
-    for j in range(3):
-        val(ws5, 15 + i, j + 2, round(float(COV_SAMPLE[i, j]), 10),
-            fmt="0.0000000000", bg=LBLUE if i == j else None)
 
-section(ws5, 19, "相關係數矩陣 ρ")
+for i in range(3):
+    val(ws5, S5_SIG_ROW+i, 1, ASSETS[i], bold=True, align="left", bg=LGRAY)
+    for j in range(3):
+        c = ws5.cell(S5_SIG_ROW+i, j+2)
+        c.value = cov_formula(i, j)
+        c.number_format = "0.0000000000"
+        c.font = Font(size=9)
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        if i == j:
+            c.fill = PatternFill("solid", fgColor=LBLUE)
+        else:
+            c.fill = PatternFill("solid", fgColor=LYELL)
+apply_border(ws5, 14, 1, S5_SIG_ROW+2, 4)
+
+# ── ② 相關係數矩陣 ρ（公式引用 Σ 儲存格）──────────────────────
+section(ws5, 19, "② 相關係數矩陣 ρ（公式引用上方 Σ：ρ[i,j]=Σ[i,j]/SQRT(Σ[i,i]×Σ[j,j])）")
+
 for c, h in enumerate([""] + ASSETS, start=1):
     hdr(ws5, 20, c, h, bg="2E75B6")
+
 for i in range(3):
-    val(ws5, 21 + i, 1, ASSETS[i], bold=True, align="left", bg=LGRAY)
+    val(ws5, S5_RHO_ROW+i, 1, ASSETS[i], bold=True, align="left", bg=LGRAY)
     for j in range(3):
-        v  = float(CORR_SAMPLE[i, j])
-        bg = LBLUE if i == j else (LGREEN if v > 0.3 else None)
-        val(ws5, 21 + i, j + 2, round(v, 4), fmt="0.0000", bg=bg)
+        c = ws5.cell(S5_RHO_ROW+i, j+2)
+        c.value = rho_formula(i, j)
+        c.number_format = "0.0000"
+        c.font = Font(size=9)
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        if i == j:
+            c.fill = PatternFill("solid", fgColor=LBLUE)
+        elif abs(float(CORR_SAMPLE[i, j])) > 0.3:
+            c.fill = PatternFill("solid", fgColor=LGREEN)
+apply_border(ws5, 20, 1, S5_RHO_ROW+2, 4)
 
-section(ws5, 25, "σ_P 計算步驟（w'Σw）")
-for c, h in enumerate(["資產", "w（TWD 市值）", "Σw（= Σ×w 第 i 元素）",
-                        "w_i × (Σw)_i", "加總 = σ²_P", ""], start=1):
+# ── ③ 市值向量 w（引用 Sheet 1）─────────────────────────────────
+section(ws5, 25, "③ 市值向量 w（引用 Sheet 1 G5:G7，TWD 計價）")
+for c, h in enumerate(["資產", "w_i（TWD 市值）", "公式文字"], start=1):
     hdr(ws5, 26, c, h, bg="2E75B6")
-sv = COV_SAMPLE @ W
-for i in range(3):
-    val(ws5, 27 + i, 1, ASSETS[i], align="left")
-    val(ws5, 27 + i, 2, round(float(W[i]),    0),    fmt="#,##0")
-    val(ws5, 27 + i, 3, round(float(sv[i]),   6),    fmt="#,##0.000000")
-    val(ws5, 27 + i, 4, round(float(W[i] * sv[i]), 4), fmt="#,##0.0000")
-val(ws5, 30, 1, "加總 = σ²_P",      bold=True, bg=LGRAY)
-val(ws5, 30, 4, round(PORT_VAR, 4), fmt="#,##0.0000", bold=True, bg=LYELL)
-val(ws5, 31, 1, "√σ²_P = σ_P (TWD)", bold=True, bg=LGRAY)
-val(ws5, 31, 4, round(PORT_STD, 4), fmt="#,##0.0000", bold=True, bg=LYELL)
 
-section(ws5, 33, "Parametric 計算結果")
-for c, h in enumerate(["項目", "公式", "數值"], start=1):
-    hdr(ws5, 34, c, h, bg="2E75B6")
-items = [
-    ("z_α",               f"NORM.S.INV({CONFIDENCE})",              round(Z_ALPHA, 6)),
-    ("σ_P（日，TWD）",    "√(w'Σw)",                                round(PORT_STD, 4)),
-    ("VaR（TWD）",        "z_α × σ_P",                              round(PAR_VAR, 2)),
-    ("CVaR（TWD）",       "φ(z_α)/(1-α) × σ_P",                    round(PAR_CVAR, 2)),
-    ("VaR%",              "VaR / 組合市值",                          round(PAR_VAR / PORTFOLIO_VALUE, 6)),
-    ("CVaR/VaR",          "CVaR / VaR",                              round(PAR_CVAR / PAR_VAR, 6)),
+for i in range(3):
+    r = S5_W_ROW + i
+    val(ws5, r, 1, ASSETS[i], align="left")
+    c = ws5.cell(r, 2)
+    c.value = f"={S1}!$G${5+i}"
+    c.number_format = "#,##0.00"
+    c.font = Font(bold=True, size=9)
+    c.fill = PatternFill("solid", fgColor=LYELL)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    val(ws5, r, 3, f"= Sheet1!G{5+i}  = {MV_BASE[i]:,.0f} TWD", align="left")
+apply_border(ws5, 26, 1, S5_W_ROW+2, 3)
+
+# ── ④ Σw 向量（展開公式引用 Σ 和 w）────────────────────────────
+section(ws5, 31, "④ Σw 向量（(Σw)[i] = Σ[i,0]×w[0]+Σ[i,1]×w[1]+Σ[i,2]×w[2]，引用上方 Σ 和 w）")
+for c, h in enumerate(["資產", "(Σw)_i 公式", "計算值（TWD）"], start=1):
+    hdr(ws5, 32, c, h, bg="2E75B6")
+
+sw_col_refs = [f"$B${S5_W_ROW+k}" for k in range(3)]   # $B$27, $B$28, $B$29
+
+for i in range(3):
+    r = S5_SW_ROW + i
+    val(ws5, r, 1, ASSETS[i], align="left")
+    # Formula: Σ[i,0]*w[0] + Σ[i,1]*w[1] + Σ[i,2]*w[2]
+    sig_refs = [f"{sig_abs(i,j)}" for j in range(3)]
+    sw_formula = "=" + "+".join(f"{sig_refs[j]}*{sw_col_refs[j]}" for j in range(3))
+    c = ws5.cell(r, 2)
+    c.value = sw_formula
+    c.number_format = "0.00000000"
+    c.font = Font(size=9)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    c.fill = PatternFill("solid", fgColor=LGREEN)
+    # display computed value for reference
+    val(ws5, r, 3, round(float(SIGMA_VEC[i]), 8), fmt="0.00000000", bg=LGRAY)
+apply_border(ws5, 32, 1, S5_SW_ROW+2, 3)
+
+# ── ⑤ σ²_P 和 σ_P（公式鏈）─────────────────────────────────────
+section(ws5, 36, "⑤ 組合方差 σ²_P = w'Σw 與標準差 σ_P = SQRT(σ²_P)")
+
+w_refs = [f"$B${S5_W_ROW+k}" for k in range(3)]
+sw_refs = [f"$B${S5_SW_ROW+k}" for k in range(3)]
+sp2_formula = "=" + "+".join(f"{w_refs[k]}*{sw_refs[k]}" for k in range(3))
+
+for r, (lbl, formula, pyval, fmt, bg) in enumerate([
+    ("σ²_P = w'Σw = Σ w_i×(Σw)_i",  sp2_formula,          PORT_VAR,  "0.00000000", LYELL),
+    ("σ_P = SQRT(σ²_P)（日，TWD）", f"=SQRT($B${S5_SP2_ROW})", PORT_STD, "#,##0.0000", LYELL),
+], start=S5_SP2_ROW):
+    val(ws5, r, 1, lbl, bold=True, align="left", bg=LGRAY)
+    c = ws5.cell(r, 2)
+    c.value = formula
+    c.number_format = fmt
+    c.font = Font(bold=True, size=9)
+    c.fill = PatternFill("solid", fgColor=bg)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    val(ws5, r, 3, round(float(pyval), 8), fmt=fmt, bg=LGRAY)
+    val(ws5, r, 4, "（Python 驗算）", align="left")
+apply_border(ws5, S5_SP2_ROW, 1, S5_SP_ROW, 4)
+
+# ── ⑥ VaR / CVaR 計算結果（全為公式）────────────────────────────
+section(ws5, 40, "⑥ Parametric VaR / CVaR 計算結果（黃色格均為 Excel 公式，可點入驗證）")
+for c, h in enumerate(["項目", "Excel 公式（值）", "公式文字", "Python 驗算值"], start=1):
+    hdr(ws5, 41, c, h, bg="2E75B6")
+
+par_results = [
+    (S5_ZA_ROW, "z_α = NORM.S.INV(0.99)",
+     "=NORM.S.INV(0.99)",
+     "NORM.S.INV(0.99)",
+     round(Z_ALPHA, 6), "0.000000"),
+    (S5_ZA_ROW+1, "σ_P（日，TWD）",
+     f"=$B${S5_SP_ROW}",
+     "= σ_P（引用上方）",
+     round(PORT_STD, 4), "#,##0.0000"),
+    (S5_VAR_ROW, "VaR = z_α × σ_P（TWD）",
+     f"=$B${S5_ZA_ROW}*$B${S5_SP_ROW}",
+     "= z_α × σ_P",
+     round(PAR_VAR, 2), "#,##0.00"),
+    (S5_CVAR_ROW, "CVaR = φ(z_α)/0.01 × σ_P（TWD）",
+     f"=NORM.DIST(-$B${S5_ZA_ROW},0,1,FALSE)/0.01*$B${S5_SP_ROW}",
+     "= φ(z_α)/(1-α) × σ_P",
+     round(PAR_CVAR, 2), "#,##0.00"),
+    (S5_CVAR_ROW+1, "VaR % (占組合市值)",
+     f"=$B${S5_VAR_ROW}/{S1}!$G$8",
+     "= VaR / 組合總市值",
+     round(PAR_VAR / PORTFOLIO_VALUE, 6), "0.00%"),
+    (S5_CVAR_ROW+2, "CVaR / VaR 倍數",
+     f"=$B${S5_CVAR_ROW}/$B${S5_VAR_ROW}",
+     "= CVaR / VaR（常態下≈1.29）",
+     round(PAR_CVAR / PAR_VAR, 6), "0.000000"),
 ]
-for r, (nm, fm, nv) in enumerate(items, start=35):
-    val(ws5, r, 1, nm, align="left", bold=True, bg=LGRAY)
-    val(ws5, r, 2, fm, align="left")
-    fmt = "#,##0.00" if abs(nv) > 1 else "0.000000"
-    val(ws5, r, 3, nv, fmt=fmt, bold=True, bg=LYELL)
+for row, lbl, formula, formula_txt, pyval, fmt in par_results:
+    val(ws5, row, 1, lbl, bold=True, align="left", bg=LGRAY)
+    c = ws5.cell(row, 2)
+    c.value = formula
+    c.number_format = fmt
+    c.font = Font(bold=True, size=9)
+    c.fill = PatternFill("solid", fgColor=LYELL)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    val(ws5, row, 3, formula_txt, align="left")
+    val(ws5, row, 4, pyval, fmt=fmt, bg=LGRAY)
+apply_border(ws5, 41, 1, S5_CVAR_ROW+2, 4)
 
-section(ws5, 42, "Component VaR（精確可加分解驗證）")
-for c, h in enumerate(["資產", "w_i (TWD)", "(Σw)_i/σ_P",
-                        "Marginal VaR", "Component VaR", "Component CVaR", "風險貢獻%"], start=1):
-    hdr(ws5, 43, c, h, bg="2E75B6")
+# ── ⑦ Component VaR（公式引用 w、Σw、z_α、σ_P）────────────────
+section(ws5, 49,
+        "⑦ Component VaR_i = w_i × z_α × (Σw)_i / σ_P（公式，Σ = Portfolio VaR 代數精確）")
+for c, h in enumerate(["資產", "w_i (B欄)", "(Σw)_i (C欄)",
+                        "Marginal VaR_i = z_α×(Σw)_i/σ_P",
+                        "Component VaR_i = w_i × MVaR_i",
+                        "風險貢獻%", "Component CVaR_i"], start=1):
+    hdr(ws5, 50, c, h, bg="2E75B6")
+
 for i in range(3):
-    cv  = float(PAR_COMP_VAR[ASSETS[i]])
-    ccv = float(PAR_COMP_CVAR[ASSETS[i]])
-    val(ws5, 44 + i, 1, ASSETS[i], align="left")
-    val(ws5, 44 + i, 2, round(float(W[i]), 0),                   fmt="#,##0")
-    val(ws5, 44 + i, 3, round(float(MC_PAR_VEC[i]), 8),          fmt="0.00000000")
-    val(ws5, 44 + i, 4, round(float(MC_PAR_VEC[i]) * Z_ALPHA, 8), fmt="0.00000000")
-    val(ws5, 44 + i, 5, round(cv,  2),                            fmt="#,##0.00", bold=True)
-    val(ws5, 44 + i, 6, round(ccv, 2),                            fmt="#,##0.00")
-    val(ws5, 44 + i, 7, round(cv / PAR_VAR, 4),                   fmt="0.00%")
+    r = S5_COMP_ROW + i
+    val(ws5, r, 1, ASSETS[i], align="left")
+    # B: w_i
+    c = ws5.cell(r, 2)
+    c.value = f"=$B${S5_W_ROW+i}"
+    c.number_format = "#,##0.00"
+    c.font = Font(size=9)
+    c.fill = PatternFill("solid", fgColor=LYELL)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    # C: (Σw)_i
+    c = ws5.cell(r, 3)
+    c.value = f"=$B${S5_SW_ROW+i}"
+    c.number_format = "0.00000000"
+    c.font = Font(size=9)
+    c.fill = PatternFill("solid", fgColor=LYELL)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    # D: Marginal VaR_i = z_α × (Σw)_i / σ_P
+    c = ws5.cell(r, 4)
+    c.value = f"=$B${S5_ZA_ROW}*$C{r}/$B${S5_SP_ROW}"
+    c.number_format = "0.00000000"
+    c.font = Font(size=9)
+    c.fill = PatternFill("solid", fgColor=LGREEN)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    # E: Component VaR_i = w_i × MVaR_i
+    c = ws5.cell(r, 5)
+    c.value = f"=$B{r}*$D{r}"
+    c.number_format = "#,##0.00"
+    c.font = Font(bold=True, size=9)
+    c.fill = PatternFill("solid", fgColor=LGREEN)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    # F: 風險貢獻%
+    c = ws5.cell(r, 6)
+    c.value = f"=$E{r}/$B${S5_VAR_ROW}"
+    c.number_format = "0.00%"
+    c.font = Font(size=9)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    # G: Component CVaR_i
+    c = ws5.cell(r, 7)
+    c.value = f"=$E{r}*NORM.DIST(-$B${S5_ZA_ROW},0,1,FALSE)/0.01/$B${S5_ZA_ROW}"
+    c.number_format = "#,##0.00"
+    c.font = Font(size=9)
+    c.fill = PatternFill("solid", fgColor=LGRAY)
+    c.alignment = Alignment(horizontal="center", vertical="center")
 
-sum_cv = sum(PAR_COMP_VAR.values())
-val(ws5, 47, 1, "加總（應 = VaR）",    bold=True, bg=LGRAY)
-val(ws5, 47, 5, round(sum_cv, 2),       fmt="#,##0.00", bold=True, bg=LGREEN)
-val(ws5, 47, 7, "✓ 誤差 < 0.01%",      bg=LGREEN)
-val(ws5, 48, 1, "Portfolio VaR（對照）", bold=True, bg=LGRAY)
-val(ws5, 48, 5, round(PAR_VAR, 2),      fmt="#,##0.00", bold=True, bg=LYELL)
-note(ws5, 49, 1,
-     f"驗證：|加總 - VaR| = {abs(sum_cv - PAR_VAR):.6e}，"
-     f"相對誤差 = {abs(sum_cv - PAR_VAR) / PAR_VAR * 100:.8f}%（數值機器精度）")
+# Sum row
+rsum = S5_COMP_ROW + 3
+val(ws5, rsum, 1, "Σ Component VaR（應 = Portfolio VaR）", bold=True, bg=LGRAY, align="left")
+c = ws5.cell(rsum, 5)
+c.value = f"=SUM(E{S5_COMP_ROW}:E{S5_COMP_ROW+2})"
+c.number_format = "#,##0.00"
+c.font = Font(bold=True, size=9)
+c.fill = PatternFill("solid", fgColor=LGREEN)
+c.alignment = Alignment(horizontal="center", vertical="center")
+c = ws5.cell(rsum, 6)
+c.value = f"=SUM(F{S5_COMP_ROW}:F{S5_COMP_ROW+2})"
+c.number_format = "0.00%"
+c.font = Font(size=9)
+c.alignment = Alignment(horizontal="center", vertical="center")
+
+# Portfolio VaR ref
+rpar = rsum + 1
+val(ws5, rpar, 1, "Portfolio VaR（對照）", bold=True, bg=LGRAY, align="left")
+c = ws5.cell(rpar, 5)
+c.value = f"=$B${S5_VAR_ROW}"
+c.number_format = "#,##0.00"
+c.font = Font(bold=True, size=9)
+c.fill = PatternFill("solid", fgColor=LYELL)
+c.alignment = Alignment(horizontal="center", vertical="center")
+
+# Deviation
+rdev = rpar + 1
+val(ws5, rdev, 1, "誤差 |Σ−VaR|/VaR", bold=True, bg=LGRAY, align="left")
+c = ws5.cell(rdev, 5)
+c.value = f"=ABS(E{rsum}-E{rpar})/E{rpar}"
+c.number_format = "0.000000%"
+c.font = Font(size=9)
+c.fill = PatternFill("solid", fgColor=LGREEN)
+c.alignment = Alignment(horizontal="center", vertical="center")
+val(ws5, rdev, 6, "← 代數精確，應 ≈ 0%", align="left")
+
+apply_border(ws5, 50, 1, rdev, 7)
+note(ws5, rdev+2, 1,
+     f"Component VaR_i = w_i × z_α × (Σw)_i / σ_P。"
+     f"驗算：|加總 - VaR| = {abs(sum(PAR_COMP_VAR.values()) - PAR_VAR):.6e}（數值機器精度）。"
+     "Sheet 6 的 Cholesky L 矩陣公式引用本頁 Σ 矩陣（B15:D17）。")
 autofit(ws5)
 
 # ════════════════════════════════════════════════════════════
-# Sheet 6 — Monte Carlo VaR
+# Sheet 6 — Monte Carlo（全公式揭露，N=500）
 # ════════════════════════════════════════════════════════════
 ws6 = wb.create_sheet("⑥Monte Carlo模擬")
-merge_hdr(ws6, 1, 1, 12, f"步驟四（MC）：蒙地卡羅法 VaR（{MC_N:,} 條路徑）")
+merge_hdr(ws6, 1, 1, 12,
+          f"步驟四（MC）：蒙地卡羅 VaR — 全公式揭露（N={N_MC6} 條路徑，seed=42）")
 
-section(ws6, 3, "方法說明 & 公式")
+section(ws6, 3, "計算步驟（z 為固定亂數，r_sim/P&L/VaR 均為 Excel 公式）")
 mc_steps = [
-    ("Step 1", "估計 FX 調整後回報的共變異數矩陣 Σ（同參數法）"),
-    ("Step 2", "對 Σ 進行 Cholesky 分解：Σ = L L'（L 為下三角矩陣）"),
-    ("Step 3", f"模擬 M={MC_N:,} 組相關常態亂數：r_sim = L×z + μ，z ~ N(0,I)"),
-    ("Step 4", "各路徑損益：P&L_k = Σ_i w_i × r_sim(k,i)"),
-    ("Step 5", f"VaR = -PERCENTILE(P&L, {(1-CONFIDENCE)*100:.0f}%) = {MC_VAR:,.2f} TWD"),
-    ("Step 6", f"CVaR = -mean(P&L[P&L ≤ -VaR]) = {MC_CVAR:,.2f} TWD"),
+    ("Step 1", "Cholesky 分解：公式引用 Sheet 5 Σ 矩陣（B15:D17）計算 L"),
+    ("Step 2", "驗證 L×L' = Σ：Excel 公式，應與 Sheet 5 Σ 一致"),
+    ("Step 3", "μ = AVERAGE(Sheet3!G/H/I)：公式引用 Sheet 3 adj 回報均值"),
+    ("Step 4", "w：公式引用 Sheet 1 G5:G7 TWD 市值"),
+    ("Step 5", f"z 亂數（B/C/D 欄）：seed=42 產生之 {N_MC6}×3 固定值，揭露於此供逐一驗核"),
+    ("Step 6", "r_sim（E/F/G 欄）：= L×z + μ 展開公式，引用 L 矩陣儲存格"),
+    ("Step 7", "P&L（H 欄）：= r_sim[台積電]×w[0]+r_sim[AAPL]×w[1]+r_sim[三星]×w[2] 公式"),
+    ("Step 8", f"VaR = -SMALL(P&L, {IDX_VAR_MC6+1})；CVaR = -(SMALL(1)+...+SMALL({IDX_VAR_MC6}))/{IDX_VAR_MC6}"),
 ]
 for r, (s, d) in enumerate(mc_steps, start=4):
     val(ws6, r, 1, s, bold=True, bg=LBLUE)
     ws6.merge_cells(start_row=r, start_column=2, end_row=r, end_column=10)
     val(ws6, r, 2, d, align="left")
 
-section(ws6, 11, "Cholesky 分解 L（手算步驟）")
-for c, h in enumerate(["", "L[i,0]", "L[i,1]", "L[i,2]", "計算公式"], start=1):
-    hdr(ws6, 12, c, h, bg="2E75B6")
-chol_formulas = [
-    (ASSETS[0], L[0,0], None,   None,   "L[0,0] = √Σ[0,0]"),
-    (ASSETS[1], L[1,0], L[1,1], None,   "L[1,0]=Σ[1,0]/L[0,0]；L[1,1]=√(Σ[1,1]−L[1,0]²)"),
-    (ASSETS[2], L[2,0], L[2,1], L[2,2],
-     "L[2,0]=Σ[2,0]/L[0,0]；L[2,1]=(Σ[2,1]−L[2,0]×L[1,0])/L[1,1]；L[2,2]=√(Σ[2,2]−L[2,0]²−L[2,1]²)"),
+# ── ① Cholesky L（公式引用 Sheet 5 Σ）─────────────────────────
+section(ws6, 12, "① Cholesky 分解 L（公式引用 Sheet 5 Σ 矩陣，Σ=L×L'）")
+for c, h in enumerate(["", "L[i,0]（B欄）", "L[i,1]（C欄）", "L[i,2]（D欄）", "公式說明"], start=1):
+    hdr(ws6, 13, c, h, bg="2E75B6")
+
+chol_formulas_txt = [
+    (ASSETS[0], f"=SQRT({S5}!{sig_addr(0,0)})", None, None,
+     f"L[0,0] = SQRT(Σ[0,0])，引用 Sheet5!{sig_addr(0,0)}"),
+    (ASSETS[1], f"={S5}!{sig_addr(1,0)}/$B${S6_L_ROW}", f"=SQRT({S5}!{sig_addr(1,1)}-$B${S6_L_ROW+1}^2)", None,
+     f"L[1,0]={S5}!{sig_addr(1,0)}/L[0,0]；L[1,1]=SQRT(Σ[1,1]-L[1,0]²)"),
+    (ASSETS[2],
+     f"={S5}!{sig_addr(2,0)}/$B${S6_L_ROW}",
+     f"=({S5}!{sig_addr(2,1)}-$B${S6_L_ROW+2}*$B${S6_L_ROW+1})/$C${S6_L_ROW+1}",
+     f"=SQRT({S5}!{sig_addr(2,2)}-$B${S6_L_ROW+2}^2-$C${S6_L_ROW+2}^2)",
+     "L[2,0]=Σ[2,0]/L[0,0]；L[2,1]=(Σ[2,1]-L[2,0]×L[1,0])/L[1,1]；L[2,2]=SQRT(Σ[2,2]-L[2,0]²-L[2,1]²)"),
 ]
-for r, (nm, l0, l1, l2, fm) in enumerate(chol_formulas, start=13):
+for row_i, (nm, l0, l1, l2, fm) in enumerate(chol_formulas_txt):
+    r = S6_L_ROW + row_i
     val(ws6, r, 1, nm, align="left", bold=True, bg=LGRAY)
-    for ci, lv in enumerate([l0, l1, l2], start=2):
-        if lv is not None:
-            val(ws6, r, ci, round(lv, 9), fmt="0.000000000", bg=LBLUE)
+    for ci, (lv, is_none) in enumerate([(l0, False), (l1, l1 is None), (l2, l2 is None)], start=2):
+        c = ws6.cell(r, ci)
+        if not is_none:
+            c.value = lv
+            c.number_format = "0.000000000"
+            c.font = Font(size=9)
+            c.fill = PatternFill("solid", fgColor=LBLUE)
+            c.alignment = Alignment(horizontal="center", vertical="center")
         else:
-            val(ws6, r, ci, "—", bg=LGRAY)
+            c.value = "—"
+            c.fill = PatternFill("solid", fgColor=LGRAY)
+            c.alignment = Alignment(horizontal="center", vertical="center")
     ws6.merge_cells(start_row=r, start_column=5, end_row=r, end_column=10)
     val(ws6, r, 5, fm, align="left")
+apply_border(ws6, 13, 1, S6_L_ROW+2, 5)
 
-section(ws6, 17, "驗證 Cholesky：L × L' 應還原 Σ")
-LLT = L @ L.T
+# ── ② L×L' 驗證（公式，應等於 Σ）────────────────────────────────
+section(ws6, 18, f"② 驗證 L×L'（公式）應還原 Sheet 5 Σ 矩陣")
 for c, h in enumerate([""] + ASSETS, start=1):
-    hdr(ws6, 18, c, h, bg=GREEN)
+    hdr(ws6, 19, c, h, bg=GREEN)
+
 for i in range(3):
-    val(ws6, 19 + i, 1, ASSETS[i], bold=True, align="left", bg=LGRAY)
+    val(ws6, S6_LLT_ROW+i, 1, ASSETS[i], bold=True, align="left", bg=LGRAY)
     for j in range(3):
-        diff = abs(float(LLT[i, j]) - float(COV_SAMPLE[i, j]))
-        val(ws6, 19 + i, j + 2, round(float(LLT[i, j]), 10),
-            fmt="0.0000000000", bg=LGREEN if diff < 1e-10 else LRED)
-note(ws6, 22, 1, "✓ 各格與 Σ 差距 < 1e-10（數值機器精度），驗證 Cholesky 正確。")
+        c = ws6.cell(S6_LLT_ROW+i, j+2)
+        c.value = llt_formula(i, j)
+        c.number_format = "0.0000000000"
+        c.font = Font(size=9)
+        c.fill = PatternFill("solid", fgColor=LGREEN)
+        c.alignment = Alignment(horizontal="center", vertical="center")
+apply_border(ws6, 19, 1, S6_LLT_ROW+2, 4)
+note(ws6, S6_LLT_ROW+3, 1,
+     f"驗證：將上表與 Sheet 5 Σ 矩陣（B15:D17）對照，差值應 < 1e-10。"
+     "公式：(L×L')[i,j] = Σ_k L[i,k]×L[j,k]（僅對角線以下的 L 元素非零）。")
 
-SHOW_MC = min(50, MC_N)
-section(ws6, 24, f"前 {SHOW_MC} 條模擬路徑（共 {MC_N:,} 條）")
-for c, h in enumerate(["路徑#", "r_sim[TSMC]", "r_sim[AAPL]", "r_sim[三星]",
-                        "P&L (TWD)", "例外?"], start=1):
+# ── ③ μ 歷史均值回報（AVERAGE 公式）─────────────────────────────
+section(ws6, 24, f"③ μ 歷史均值回報（AVERAGE 公式，引用 Sheet 3 G/H/I 欄，T={T} 筆）")
+for c, h in enumerate(["資產", "μ（AVERAGE 公式）", "公式文字"], start=1):
     hdr(ws6, 25, c, h, bg="2E75B6")
-var_threshold = -MC_VAR
-for k in range(SHOW_MC):
-    r   = k + 26
-    pk  = float(PNL_MC[k])
-    exc = pk < var_threshold
+
+for i in range(3):
+    r = S6_MU_ROW + i
+    val(ws6, r, 1, ASSETS[i], align="left")
+    c = ws6.cell(r, 2)
+    c.value = f"=AVERAGE({S3}!${ADJ_COLS[i]}${S3_DATA_START}:${ADJ_COLS[i]}${S3_DATA_END})"
+    c.number_format = "0.0000000000"
+    c.font = Font(bold=True, size=9)
+    c.fill = PatternFill("solid", fgColor=LYELL)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    val(ws6, r, 3,
+        f"=AVERAGE(Sheet3!${ADJ_COLS[i]}${S3_DATA_START}:${ADJ_COLS[i]}${S3_DATA_END})"
+        f"  ≈ {float(MU_RET[i]):.8f}",
+        align="left")
+apply_border(ws6, 25, 1, S6_MU_ROW+2, 3)
+
+# ── ④ w 向量（引用 Sheet 1）──────────────────────────────────────
+section(ws6, 30, "④ w 向量（引用 Sheet 1 G5:G7，TWD 市值）")
+for c, h in enumerate(["資產", "w_i（TWD）", "公式文字"], start=1):
+    hdr(ws6, 31, c, h, bg="2E75B6")
+
+for i in range(3):
+    r = S6_W_ROW + i
+    val(ws6, r, 1, ASSETS[i], align="left")
+    c = ws6.cell(r, 2)
+    c.value = f"={S1}!$G${5+i}"
+    c.number_format = "#,##0.00"
+    c.font = Font(bold=True, size=9)
+    c.fill = PatternFill("solid", fgColor=LYELL)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    val(ws6, r, 3, f"= Sheet1!G{5+i}  ≈ {MV_BASE[i]:,.0f} TWD", align="left")
+apply_border(ws6, 31, 1, S6_W_ROW+2, 3)
+
+# ── ⑤ 模擬路徑（z 固定值 + r_sim/P&L 公式）─────────────────────
+section(ws6, 36,
+        f"⑤ 模擬路徑（N={N_MC6}）：B/C/D=z 固定亂數（seed=42）；E/F/G=r_sim 公式；H=P&L 公式")
+note(ws6, 37, 1,
+     "B/C/D 欄（z₁/z₂/z₃）：NumPy seed=42 產生之固定常態亂數，揭露於此供逐一驗核。"
+     f"E欄 r_sim₁ 公式：=$B${S6_L_ROW}*B{{r}}+$B${S6_MU_ROW}（= L[0,0]×z₁ + μ₁）；"
+     f"F欄 r_sim₂：=$B${S6_L_ROW+1}*B{{r}}+$C${S6_L_ROW+1}*C{{r}}+$B${S6_MU_ROW+1}；"
+     f"G欄 r_sim₃：=$B${S6_L_ROW+2}*B+$C${S6_L_ROW+2}*C+$D${S6_L_ROW+2}*D+$B${S6_MU_ROW+2}；"
+     f"H欄 P&L：=E×$B${S6_W_ROW}+F×$B${S6_W_ROW+1}+G×$B${S6_W_ROW+2}")
+
+for c, h in enumerate(["路徑#",
+                        "z₁(台積電方向)", "z₂(AAPL方向)", "z₃(三星方向)",
+                        "r_sim₁[台積電]", "r_sim₂[AAPL]", "r_sim₃[三星]",
+                        "P&L(TWD)"], start=1):
+    hdr(ws6, 38, c, h, bg="2E75B6")
+
+# 重新命名header row（S6_DATA_START現在是38）
+# 路徑資料從39開始（header在38）
+S6_DATA_START_ACTUAL = 39   # 資料從這裡開始（38是header）
+S6_DATA_END_ACTUAL   = S6_DATA_START_ACTUAL + N_MC6 - 1   # 538
+
+pnl_range_mc6 = f"$H${S6_DATA_START_ACTUAL}:$H${S6_DATA_END_ACTUAL}"
+
+for k in range(N_MC6):
+    r = S6_DATA_START_ACTUAL + k
     val(ws6, r, 1, k + 1)
-    for ci in range(3):
-        val(ws6, r, ci + 2, round(float(SIM[k, ci]), 6), fmt="0.000000")
-    val(ws6, r, 5, round(pk, 2), fmt="#,##0.00",
-        bg=LRED if exc else (LGREEN if pk > 0 else None), bold=exc)
-    val(ws6, r, 6, "例外" if exc else "", bg=LRED if exc else None)
+    # z values — hardcoded fixed values (visible for verification)
+    for zi in range(3):
+        c = ws6.cell(r, zi+2)
+        c.value = round(float(Z_MC6[k, zi]), 9)
+        c.number_format = "0.000000000"
+        c.font = Font(size=8)
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        c.fill = PatternFill("solid", fgColor=LGRAY)
+    # r_sim formulas (E, F, G) — = L×z + μ
+    for ai in range(3):
+        c = ws6.cell(r, ai+5)
+        c.value = rsim_formula(ai, r)
+        c.number_format = "0.000000"
+        c.font = Font(size=8)
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        c.fill = PatternFill("solid", fgColor=LBLUE)
+    # P&L formula (H)
+    c = ws6.cell(r, 8)
+    c.value = pnl_formula_mc6(r)
+    c.number_format = "#,##0.00"
+    c.font = Font(size=8)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    pnl_py = float(PNL_MC6[k])
+    if pnl_py < 0:
+        c.fill = PatternFill("solid", fgColor=LRED)
+    elif pnl_py > 0:
+        c.fill = PatternFill("solid", fgColor=LGREEN)
 
-note(ws6, SHOW_MC + 27, 1,
-     f"僅展示前 {SHOW_MC} 條路徑，完整 {MC_N:,} 條用於計算 VaR/CVaR。")
+apply_border(ws6, 38, 1, S6_DATA_END_ACTUAL, 8)
 
-section(ws6, SHOW_MC + 29, "MC 計算結果")
-mc_res = [
-    ("MC VaR（TWD）",   round(MC_VAR,  2), f"-PERCENTILE(P&L, {(1-CONFIDENCE)*100:.0f}%)"),
-    ("MC CVaR（TWD）",  round(MC_CVAR, 2), "−mean(P&L[P&L ≤ −VaR])"),
-    ("VaR%（占市值）",  round(MC_VAR / PORTFOLIO_VALUE, 6), "VaR / 組合市值"),
-    ("CVaR/VaR",        round(MC_CVAR / MC_VAR, 6),         "CVaR / VaR"),
-    ("例外路徑數",      int(np.sum(PNL_MC < -MC_VAR)),
-     f"≈ {MC_N}×1% = {MC_N*0.01:.0f}"),
+# ── ⑥ MC 計算結果（VaR/CVaR 均為 SMALL() 公式）──────────────────
+S6_VAR_ROW_ACTUAL = S6_DATA_END_ACTUAL + 3   # 結果區起始列
+
+section(ws6, S6_VAR_ROW_ACTUAL - 1,
+        f"⑥ MC 計算結果（VaR/CVaR 均為 SMALL() 公式，H 欄 P&L 共 {N_MC6} 筆）")
+for c, h in enumerate(["項目", "Excel 公式（值）", "公式文字說明"], start=1):
+    hdr(ws6, S6_VAR_ROW_ACTUAL, c, h, bg="2E75B6")
+
+# IDX_VAR_MC6 = 5 → VaR = 第6小 P&L 的負值
+var_formula_mc6  = f"=-SMALL({pnl_range_mc6},{IDX_VAR_MC6+1})"
+cvar_terms = "+".join(f"SMALL({pnl_range_mc6},{k})" for k in range(1, IDX_VAR_MC6+1))
+cvar_formula_mc6 = f"=-({cvar_terms})/{IDX_VAR_MC6}"
+
+mc_result_rows = [
+    (S6_VAR_ROW_ACTUAL+1,  f"分位索引 idx = floor(0.01×{N_MC6})",
+     IDX_VAR_MC6,
+     f"={IDX_VAR_MC6}（= floor(0.01×{N_MC6})，VaR 取第 {IDX_VAR_MC6+1} 小 P&L 的負值）",
+     "#,##0"),
+    (S6_VAR_ROW_ACTUAL+2,  f"MC VaR（99%, 1日, TWD）",
+     var_formula_mc6,
+     f"=-SMALL(H欄P&L, {IDX_VAR_MC6+1})  （第 {IDX_VAR_MC6+1} 小 P&L 的負值）",
+     "#,##0.00"),
+    (S6_VAR_ROW_ACTUAL+3,  f"MC CVaR（TWD）",
+     cvar_formula_mc6,
+     f"=-(最差{IDX_VAR_MC6}筆P&L之和)/{IDX_VAR_MC6}  （SMALL(1)+...+SMALL({IDX_VAR_MC6})）",
+     "#,##0.00"),
+    (S6_VAR_ROW_ACTUAL+4,  "VaR % (占組合市值)",
+     f"=B{S6_VAR_ROW_ACTUAL+2}/{S1}!$G$8",
+     "= VaR / 組合總市值",
+     "0.00%"),
+    (S6_VAR_ROW_ACTUAL+5,  "CVaR / VaR 倍數",
+     f"=B{S6_VAR_ROW_ACTUAL+3}/B{S6_VAR_ROW_ACTUAL+2}",
+     "= CVaR / VaR",
+     "0.000000"),
+    (S6_VAR_ROW_ACTUAL+6,  "例外路徑數（P&L < -VaR）",
+     f"=COUNTIF({pnl_range_mc6},\"<\"&(-B{S6_VAR_ROW_ACTUAL+2}))",
+     f"應約 {N_MC6}×1% = {N_MC6*0.01:.0f} 條",
+     "#,##0"),
 ]
-for r, (lbl, nv, fm) in enumerate(mc_res, start=SHOW_MC + 30):
-    val(ws6, r, 1, lbl, bold=True, align="left", bg=LGRAY)
-    fmt = "#,##0.00" if isinstance(nv, float) and abs(nv) > 1 else (
-        "#,##0" if isinstance(nv, int) else "0.000000")
-    val(ws6, r, 2, nv, fmt=fmt, bold=True, bg=LYELL)
-    ws6.merge_cells(start_row=r, start_column=3, end_row=r, end_column=6)
-    val(ws6, r, 3, fm, align="left")
+for row, lbl, formula_or_val, desc, fmt in mc_result_rows:
+    val(ws6, row, 1, lbl, bold=True, align="left", bg=LGRAY)
+    c = ws6.cell(row, 2)
+    c.value = formula_or_val
+    c.number_format = fmt
+    c.font = Font(bold=True, size=9)
+    c.fill = PatternFill("solid", fgColor=LYELL)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws6.merge_cells(start_row=row, start_column=3, end_row=row, end_column=8)
+    val(ws6, row, 3, desc, align="left")
+apply_border(ws6, S6_VAR_ROW_ACTUAL, 1, S6_VAR_ROW_ACTUAL+6, 3)
 
-section(ws6, SHOW_MC + 36, "Component VaR（MC 尾端均值）")
-for c, h in enumerate(["資產", "Component VaR(TWD)", "Component CVaR(TWD)", "風險貢獻%"], start=1):
-    hdr(ws6, SHOW_MC + 37, c, h, bg="2E75B6")
-for i, nm in enumerate(ASSETS):
-    val(ws6, SHOW_MC + 38 + i, 1, nm, align="left")
-    val(ws6, SHOW_MC + 38 + i, 2, round(float(MC_COMP_VAR[nm]),  2), fmt="#,##0.00")
-    val(ws6, SHOW_MC + 38 + i, 3, round(float(MC_COMP_CVAR[nm]), 2), fmt="#,##0.00")
-    val(ws6, SHOW_MC + 38 + i, 4, round(float(MC_COMP_VAR[nm]) / MC_VAR, 4), fmt="0.00%")
-note(ws6, SHOW_MC + 42, 1,
-     "MC Component VaR：各資產在組合尾端場景（P&L ≤ −VaR）下的平均損失。")
+note(ws6, S6_VAR_ROW_ACTUAL+8, 1,
+     f"Python 驗算（{N_MC6} 路徑，seed=42）：VaR={MC_VAR6:,.2f} TWD，CVaR={MC_CVAR6:,.2f} TWD。"
+     f"Excel 公式 SMALL() 使用 H 欄 {N_MC6} 筆 P&L 直接計算，可完全驗核。"
+     f"Sheet ⑦ 比較使用 {MC_N:,} 條路徑（更精確）。")
 autofit(ws6)
 
 # ════════════════════════════════════════════════════════════
@@ -796,7 +1154,7 @@ compare_rows = [
                           MC_VAR / PORTFOLIO_VALUE, "0.00%", "相對風險水準"),
     ("CVaR / VaR",        HS_CVAR / HS_VAR, PAR_CVAR / PAR_VAR, MC_CVAR / MC_VAR,
                           "0.0000", "尾端形狀（常態≈1.29）"),
-    ("損益標準差（TWD）", float(PNL_HS.std()), PORT_STD, float(PNL_MC.std()),
+    ("損益標準差（TWD）", float(PNL_HS.std()), PORT_STD, float(PNL_FULL.std()),
                           "#,##0.00", "1日組合損益σ"),
 ]
 for r, (lbl, hs_v, par_v, mc_v, fmt, note_t) in enumerate(compare_rows, start=5):
@@ -850,7 +1208,7 @@ checks = [
      "—",
      f"{PAR_VAR:,.0f}",
      f"{MC_VAR:,.0f}（差 {abs(MC_VAR-PAR_VAR)/PAR_VAR*100:.1f}%）",
-     "大樣本下 MC ≈ Param（同常態假設）",
+     f"大樣本（M={MC_N:,}）下 MC ≈ Param（同常態假設）",
      "✓" if abs(MC_VAR - PAR_VAR) / PAR_VAR < 0.05 else "需更多路徑"),
 ]
 for r, row_data in enumerate(checks, start=19):
@@ -862,7 +1220,8 @@ apply_border(ws7, 18, 1, 22, 6)
 
 note(ws7, 24, 1,
      f"資料期間：{DATES[0].strftime('%Y-%m-%d')} ~ {DATES[-1].strftime('%Y-%m-%d')}，"
-     f"T={T}，N_MC={MC_N:,}，α=99%，h=1日。")
+     f"T={T}，α=99%，h=1日。"
+     f"Sheet ⑦ 比較使用 N_MC={MC_N:,}（5000路徑）；Sheet ⑥ 公式揭露使用 N=500（所有路徑可見）。")
 autofit(ws7)
 
 # ════════════════════════════════════════════════════════════
@@ -871,6 +1230,9 @@ autofit(ws7)
 OUT = os.path.join(os.path.dirname(__file__), "VaR_逐步驗證.xlsx")
 wb.save(OUT)
 print(f"\n[完成] 已儲存至：{OUT}")
-print(f"  Sheet 2 資料：{N_DAYS+1} 列（含初始 S0）")
-print(f"  Sheet 3 公式：LN() 直接引用 Sheet 2，P&L 引用 Sheet 1 市值")
-print(f"  Sheet 4 公式：SMALL() 引用 Sheet 3 P&L，VaR/CVaR 結果格亦為公式")
+print(f"  Sheet 2：{N_DAYS+1} 列原始價格（含初始 S0）")
+print(f"  Sheet 3：LN() 公式引用 Sheet 2，P&L 引用 Sheet 1 市值")
+print(f"  Sheet 4：SMALL() 引用 Sheet 3 P&L，VaR/CVaR 結果格亦為公式")
+print(f"  Sheet 5：COVARIANCE.S() Σ → ρ/Σw/σ_P/z_α/VaR/CVaR/ComponentVaR 完整公式鏈")
+print(f"  Sheet 6：Cholesky L 引用 Sheet5 Σ，μ/w 引用 Sheet3/Sheet1，")
+print(f"           z={N_MC6}×3 固定值揭露，r_sim=L×z+μ 公式，P&L 公式，VaR=-SMALL() 公式")
